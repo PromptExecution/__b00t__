@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod cloud_sync;
 pub mod datum_ai;
+pub mod datum_api;
 pub mod datum_apt;
 pub mod datum_bash;
 pub mod datum_docker;
@@ -13,6 +14,7 @@ pub mod datum_stack;
 pub mod datum_vscode;
 pub mod dependency_resolver;
 pub mod k8s;
+pub mod orchestrator;
 pub mod session_memory;
 pub mod traits;
 pub mod utils;
@@ -99,6 +101,19 @@ pub struct BootDatum {
     // MCP-specific multi-method support - these will be handled by datum_mcp module
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mcp: Option<McpMethods>,
+
+    // API-specific fields for protocol composition
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<String>, // Protocol specification (e.g., "openai-embeddings-v1")
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub implements: Option<Vec<String>>, // Protocol interfaces this implements
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provides: Option<ApiProvides>, // Capabilities provided by this API
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requires: Option<std::collections::HashMap<String, CapabilityRequirement>>, // Required capabilities
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
@@ -107,6 +122,37 @@ pub struct McpMethods {
     pub stdio: Option<Vec<std::collections::HashMap<String, serde_json::Value>>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub httpstream: Option<std::collections::HashMap<String, serde_json::Value>>,
+}
+
+// API capability structures
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
+pub struct ApiProvides {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capability: Option<String>, // High-level capability (e.g., "embeddings", "rag")
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoints: Option<Vec<String>>, // API endpoints provided
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub models: Option<serde_json::Value>, // Available models (flexible structure)
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operations: Option<Vec<String>>, // Supported operations
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
+pub struct CapabilityRequirement {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capability: Option<String>, // Required capability name
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<String>, // Required protocol compliance
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefer: Option<Vec<String>>, // Preferred implementations in order
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<String>, // Ultimate fallback if preferred unavailable
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
@@ -121,6 +167,7 @@ pub enum DatumType {
     Apt,
     Nix,
     Ai,
+    Api,      // API protocol endpoints (OpenAI-compat, embeddings, etc.)
     Cli,
     Stack,
 }
@@ -341,6 +388,11 @@ fn create_mcp_datum_from_json(
             ]),
             httpstream: None,
         }),
+        // API-specific fields (not used for MCP datums)
+        protocol: None,
+        implements: None,
+        provides: None,
+        requires: None,
     }
 }
 
@@ -430,6 +482,11 @@ pub fn normalize_mcp_json(input: &str, dwiw: bool) -> Result<BootDatum> {
                             .collect(),
                     ),
                 }),
+                // API-specific fields (not used for MCP datums)
+                protocol: None,
+                implements: None,
+                provides: None,
+                requires: None,
             });
         }
 
@@ -526,6 +583,7 @@ pub fn create_unified_toml_config(datum: &BootDatum, path: &str) -> Result<()> {
         DatumType::Apt => ".apt.toml",
         DatumType::Nix => ".nix.toml",
         DatumType::Ai => ".ai.toml",
+        DatumType::Api => ".api.toml",
         DatumType::Cli => ".cli.toml",
         DatumType::Stack => ".stack.toml",
         DatumType::Unknown => ".toml",
@@ -558,6 +616,7 @@ impl std::fmt::Display for DatumType {
             DatumType::Apt => write!(f, "apt"),
             DatumType::Nix => write!(f, "nix"),
             DatumType::Ai => write!(f, "AI"),
+            DatumType::Api => write!(f, "API"),
             DatumType::Cli => write!(f, "CLI"),
             DatumType::Stack => write!(f, "stack"),
         }
@@ -654,6 +713,10 @@ pub fn get_config(
         ".apt.toml",
         ".nix.toml",
         ".bash.toml",
+        ".k8s.toml",     // Kubernetes deployments
+        ".api.toml",     // API protocol definitions
+        ".ai.toml",      // AI model configurations
+        ".stack.toml",   // Stack compositions
         ".toml",
     ];
 
