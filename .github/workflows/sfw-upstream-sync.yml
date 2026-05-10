@@ -1,0 +1,356 @@
+# .github/workflows/sfw-upstream-sync.yml
+# Triggered when elasticdotventures/_b00t_ merges to main.
+# Produces the SFW (safe-for-work) __b00t__ variant via MECE audit,
+# ledgrrr enterprise attestation, and cosign/GitHub Attestations signing.
+#
+# Trigger path:
+#   elasticdotventures/_b00t_ push→main
+#     → dispatch-downstream.yml fires repository_dispatch to this repo
+#       (event type: upstream_sync)
+#
+# This workflow also accepts workflow_dispatch for manual/ad-hoc runs.
+
+name: 🔒 SFW Upstream Sync — MECE Audit & Attestation
+
+on:
+  repository_dispatch:
+    types: [upstream_sync]     # fired by elasticdotventures/_b00t_ dispatch-downstream.yml
+  workflow_dispatch:
+    inputs:
+      upstream_sha:
+        description: "Upstream commit SHA (elasticdotventures/_b00t_)"
+        required: false
+        default: ""
+      diff_base:
+        description: "Diff base ref (default: HEAD~1)"
+        required: false
+        default: "HEAD~1"
+
+permissions:
+  contents: write          # push SFW branch + commit LEDGRRR.md
+  pull-requests: write     # open PR to main
+  id-token: write          # OIDC token for keyless cosign + gh attestation
+  attestations: write      # GitHub Attestations API
+
+env:
+  UPSTREAM_REPO: elasticdotventures/_b00t_
+  DOWNSTREAM_REPO: PromptExecution/__b00t__
+  SFW_BRANCH: sfw/upstream-sync
+  AUDIT_DIR: /tmp/sfw-audit
+
+jobs:
+  # --------------------------------------------------------------------------
+  # Job 1: Sync upstream, run MECE SFW audit
+  # --------------------------------------------------------------------------
+  sfw-audit:
+    name: 🔍 MECE SFW Audit
+    runs-on: ubuntu-latest
+    outputs:
+      upstream_sha:   ${{ steps.upstream.outputs.sha }}
+      audit_pass:     ${{ steps.audit.outputs.pass }}
+      audit_sanitize: ${{ steps.audit.outputs.sanitize }}
+      audit_exclude:  ${{ steps.audit.outputs.exclude }}
+      audit_review:   ${{ steps.audit.outputs.review }}
+      sfw_branch:     ${{ steps.branch.outputs.name }}
+      has_changes:    ${{ steps.changes.outputs.has_changes }}
+
+    steps:
+      - name: Checkout __b00t__ (downstream SFW)
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.WORKFLOW_PAT || secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Configure git author
+        run: |
+          git config user.name  "b00t-sfw-agent[bot]"  # output: git author name
+          git config user.email "sfw-agent@promptexecution.com"  # output: git author email
+
+      - name: Add & fetch upstream remote
+        run: |
+          git remote add upstream https://github.com/${{ env.UPSTREAM_REPO }}.git || true
+          git fetch upstream main  # output: fetch upstream/main
+
+      - name: Resolve upstream SHA
+        id: upstream
+        run: |
+          if [[ -n "${{ github.event.client_payload.sha || github.event.inputs.upstream_sha }}" ]]; then
+            SHA="${{ github.event.client_payload.sha || github.event.inputs.upstream_sha }}"
+          else
+            SHA="$(git rev-parse upstream/main)"
+          fi
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "Upstream SHA: $SHA"  # output: upstream SHA
+
+      - name: Create SFW sync branch
+        id: branch
+        run: |
+          BRANCH="${{ env.SFW_BRANCH }}-${{ steps.upstream.outputs.sha && steps.upstream.outputs.sha || 'manual' }}"
+          BRANCH="${BRANCH:0:60}"  # GitHub branch name limit
+          git checkout -B "$BRANCH"
+          echo "name=$BRANCH" >> "$GITHUB_OUTPUT"
+          echo "Branch: $BRANCH"  # output: branch name
+
+      - name: "Merge upstream into SFW branch (theirs strategy on conflict)"
+        run: |
+          git merge upstream/main \
+            --no-commit \
+            --no-ff \
+            --strategy-option=theirs \
+            || true  # conflicts resolved in audit step
+
+      - name: Run SFW MECE audit
+        id: audit
+        run: |
+          chmod +x scripts/sfw-audit.sh
+          DIFF_BASE="${{ github.event.inputs.diff_base || 'HEAD' }}"
+
+          mkdir -p "${{ env.AUDIT_DIR }}"
+
+          # Run audit; exit 1 means excluded files found (non-fatal)
+          set +e
+          UPSTREAM_REMOTE=upstream \
+            scripts/sfw-audit.sh \
+            "upstream/main" \
+            "${{ env.AUDIT_DIR }}"
+          AUDIT_EXIT=$?
+          set -e
+
+          # Parse manifest for outputs
+          MANIFEST="${{ env.AUDIT_DIR }}/sfw-manifest.json"
+          pass=$(python3     -c "import json; d=json.load(open('$MANIFEST')); print(len(d['mece']['PASS']))")
+          sanitize=$(python3 -c "import json; d=json.load(open('$MANIFEST')); print(len(d['mece']['SANITIZE']))")
+          exclude=$(python3  -c "import json; d=json.load(open('$MANIFEST')); print(len(d['mece']['EXCLUDE']))")
+          review=$(python3   -c "import json; d=json.load(open('$MANIFEST')); print(len(d['mece']['REVIEW']))")
+
+          echo "pass=$pass"         >> "$GITHUB_OUTPUT"
+          echo "sanitize=$sanitize" >> "$GITHUB_OUTPUT"
+          echo "exclude=$exclude"   >> "$GITHUB_OUTPUT"
+          echo "review=$review"     >> "$GITHUB_OUTPUT"
+
+          echo "### 🔍 MECE SFW Audit" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Category | Count |"  >> "$GITHUB_STEP_SUMMARY"
+          echo "|----------|------:|"  >> "$GITHUB_STEP_SUMMARY"
+          echo "| ✅ PASS | $pass |"   >> "$GITHUB_STEP_SUMMARY"
+          echo "| 🔧 SANITIZE | $sanitize |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| 🚫 EXCLUDE | $exclude |"   >> "$GITHUB_STEP_SUMMARY"
+          echo "| ⚠️ REVIEW | $review |"     >> "$GITHUB_STEP_SUMMARY"
+
+          [[ "$AUDIT_EXIT" -le 1 ]] || exit $AUDIT_EXIT  # 0=clean 1=excluded; >1=script error
+
+      - name: Remove excluded files from SFW branch
+        run: |
+          BLOCKED="${{ env.AUDIT_DIR }}/blocked-files.txt"
+          if [[ -s "$BLOCKED" ]]; then
+            while IFS= read -r entry; do
+              file="${entry%%  #*}"  # strip inline comment
+              file="$(echo "$file" | xargs)"  # trim whitespace
+              [[ -z "$file" || ! -f "$file" ]] && continue
+              git rm --cached --force "$file" || true
+              rm -f "$file"
+              echo "Excluded: $file"  # output: excluded file
+            done < "$BLOCKED"
+          fi
+
+      - name: Copy audit artifacts into repo (for PR)
+        run: |
+          mkdir -p .sfw-audit
+          cp "${{ env.AUDIT_DIR }}/sfw-audit-report.md" .sfw-audit/
+          cp "${{ env.AUDIT_DIR }}/sfw-manifest.json"   .sfw-audit/
+          # Patch is large; only include if under 1MB
+          PATCH="${{ env.AUDIT_DIR }}/sfw-diff.patch"
+          [[ -f "$PATCH" && $(wc -c < "$PATCH") -lt 1048576 ]] && \
+            cp "$PATCH" .sfw-audit/ || true
+
+      - name: Check for meaningful changes
+        id: changes
+        run: |
+          if git diff --cached --quiet && git diff --quiet; then
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            echo "No changes to commit."  # output: no-op
+          else
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+            echo "Changes detected."  # output: changes present
+          fi
+
+      - name: Commit SFW changeset
+        if: steps.changes.outputs.has_changes == 'true'
+        run: |
+          git add -A
+          git commit -m "chore(sfw): sync from elasticdotventures/_b00t_ @ ${{ steps.upstream.outputs.sha }}
+
+          MECE audit:
+          - PASS:     ${{ steps.audit.outputs.audit_pass }}
+          - SANITIZE: ${{ steps.audit.outputs.audit_sanitize }}
+          - EXCLUDE:  ${{ steps.audit.outputs.audit_exclude }}
+          - REVIEW:   ${{ steps.audit.outputs.audit_review }}
+
+          Attestation: pending (see .sfw-audit/sfw-manifest.json)
+          Signed-off-by: b00t-sfw-agent[bot] <sfw-agent@promptexecution.com>"
+
+      - name: Upload audit artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sfw-audit-${{ github.run_id }}
+          path: |
+            ${{ env.AUDIT_DIR }}/sfw-audit-report.md
+            ${{ env.AUDIT_DIR }}/sfw-manifest.json
+            ${{ env.AUDIT_DIR }}/sfw-diff.patch
+            ${{ env.AUDIT_DIR }}/blocked-files.txt
+          retention-days: 90
+
+      - name: Push SFW branch
+        if: steps.changes.outputs.has_changes == 'true'
+        run: |
+          git push origin "${{ steps.branch.outputs.name }}" --force
+          echo "Pushed: ${{ steps.branch.outputs.name }}"  # output: branch pushed
+
+  # --------------------------------------------------------------------------
+  # Job 2: ledgrrr attestation + cosign signing
+  # --------------------------------------------------------------------------
+  attest-and-sign:
+    name: 📝 ledgrrr Attestation & Signing
+    needs: sfw-audit
+    if: needs.sfw-audit.outputs.has_changes == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout SFW branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sfw-audit.outputs.sfw_branch }}
+          token: ${{ secrets.WORKFLOW_PAT || secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Configure git author
+        run: |
+          git config user.name  "b00t-sfw-agent[bot]"
+          git config user.email "sfw-agent@promptexecution.com"
+
+      - name: Download audit artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: sfw-audit-${{ github.run_id }}
+          path: /tmp/sfw-audit
+
+      - name: Install cosign (if available)
+        continue-on-error: true
+        uses: sigstore/cosign-installer@v3
+
+      - name: Run ledgrrr attestation
+        env:
+          GITHUB_TOKEN:        ${{ secrets.GITHUB_TOKEN }}
+          COSIGN_PRIVATE_KEY:  ${{ secrets.COSIGN_PRIVATE_KEY }}
+          COSIGN_PASSWORD:     ${{ secrets.COSIGN_PASSWORD }}
+          LEDGRRR_FILE:        LEDGRRR.md
+        run: |
+          chmod +x scripts/ledgrrr-attest.sh
+          scripts/ledgrrr-attest.sh \
+            /tmp/sfw-audit/sfw-manifest.json \
+            /tmp/sfw-audit/sfw-audit-report.md \
+            /tmp/sfw-audit/sfw-diff.patch
+
+      - name: Use GitHub Attestations (build provenance) for manifest
+        uses: actions/attest-build-provenance@v1
+        continue-on-error: true   # graceful degradation if OIDC unavailable
+        with:
+          subject-path: /tmp/sfw-audit/sfw-manifest.json
+
+      - name: Commit LEDGRRR.md update
+        run: |
+          git add LEDGRRR.md .sfw-audit/ || true
+          git diff --cached --quiet && echo "No ledger changes." && exit 0 || true
+          git commit -m "chore(ledgrrr): attest SFW sync @ $(git rev-parse --short HEAD)
+
+          Signed-off-by: b00t-sfw-agent[bot] <sfw-agent@promptexecution.com>"
+          git push origin "${{ needs.sfw-audit.outputs.sfw_branch }}"
+
+  # --------------------------------------------------------------------------
+  # Job 3: Open PR to main with audit report as description
+  # --------------------------------------------------------------------------
+  open-pr:
+    name: 📬 Open SFW Sync PR
+    needs: [sfw-audit, attest-and-sign]
+    if: needs.sfw-audit.outputs.has_changes == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout SFW branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sfw-audit.outputs.sfw_branch }}
+          token: ${{ secrets.WORKFLOW_PAT || secrets.GITHUB_TOKEN }}
+
+      - name: Download audit report
+        uses: actions/download-artifact@v4
+        with:
+          name: sfw-audit-${{ github.run_id }}
+          path: /tmp/sfw-audit
+
+      - name: Create or update PR
+        env:
+          GH_TOKEN: ${{ secrets.WORKFLOW_PAT || secrets.GITHUB_TOKEN }}
+        run: |
+          REPORT_BODY="$(cat /tmp/sfw-audit/sfw-audit-report.md)"
+          UPSTREAM_SHA="${{ needs.sfw-audit.outputs.upstream_sha }}"
+          BRANCH="${{ needs.sfw-audit.outputs.sfw_branch }}"
+
+          PR_BODY="## 🔒 SFW Upstream Sync
+
+          **Upstream**: [\`elasticdotventures/_b00t_\`](https://github.com/elasticdotventures/_b00t_) @ \`${UPSTREAM_SHA:0:8}\`
+          **Workflow run**: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+          MECE audit counts:
+          - ✅ PASS: ${{ needs.sfw-audit.outputs.audit_pass }}
+          - 🔧 SANITIZE: ${{ needs.sfw-audit.outputs.audit_sanitize }}
+          - 🚫 EXCLUDE: ${{ needs.sfw-audit.outputs.audit_exclude }}
+          - ⚠️ REVIEW: ${{ needs.sfw-audit.outputs.audit_review }}
+
+          Attestation & signing: see \`.sfw-audit/sfw-manifest.json\` + \`LEDGRRR.md\`
+
+          ---
+
+          ${REPORT_BODY}
+
+          ---
+
+          > 🤖 Generated by \`sfw-upstream-sync\` workflow | ledgrrr enterprise attestation ✅"
+
+          # Check for existing open PR for this branch
+          EXISTING_PR=$(gh pr list \
+            --repo "${{ github.repository }}" \
+            --head "$BRANCH" \
+            --state open \
+            --json number \
+            --jq '.[0].number' 2>/dev/null || echo "")
+
+          if [[ -n "$EXISTING_PR" ]]; then
+            echo "Updating PR #$EXISTING_PR"  # output: PR update
+            gh pr edit "$EXISTING_PR" \
+              --repo "${{ github.repository }}" \
+              --body "$PR_BODY"
+          else
+            echo "Creating new PR"  # output: PR create
+            gh pr create \
+              --repo "${{ github.repository }}" \
+              --base main \
+              --head "$BRANCH" \
+              --title "🔒 SFW sync: elasticdotventures/_b00t_ @ ${UPSTREAM_SHA:0:8}" \
+              --body "$PR_BODY" \
+              --label "sfw-audit,upstream-sync" || \
+            gh pr create \
+              --repo "${{ github.repository }}" \
+              --base main \
+              --head "$BRANCH" \
+              --title "🔒 SFW sync: elasticdotventures/_b00t_ @ ${UPSTREAM_SHA:0:8}" \
+              --body "$PR_BODY"
+          fi
+
+      - name: Post audit summary
+        run: |
+          echo "## ✅ SFW Sync PR opened/updated" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Branch: \`${{ needs.sfw-audit.outputs.sfw_branch }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "Upstream: \`${{ needs.sfw-audit.outputs.upstream_sha }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          cat /tmp/sfw-audit/sfw-audit-report.md >> "$GITHUB_STEP_SUMMARY" || true

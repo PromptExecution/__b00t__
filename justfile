@@ -564,3 +564,40 @@ orchestrator-k0s-kata MODE="start" INVENTORY="~/.config/b00t/k0s-inventory.yaml"
     INVENTORY="${INVENTORY:-$HOME/.config/b00t/k0s-inventory.yaml}"
     EXTRA_ARGS="${EXTRA_ARGS:-}"
     K0S_KATA_EXTRA_ARGS="$EXTRA_ARGS" scripts/orchestrators/k0s_kata.sh "$MODE" "$INVENTORY"
+
+# SFW audit & attestation recipes ─────────────────────────────────────────────
+
+# Run SFW MECE audit against HEAD~1 (or provide base ref)
+sfw-audit BASE="HEAD~1" OUT="/tmp/sfw-audit":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    chmod +x scripts/sfw-audit.sh
+    UPSTREAM_REMOTE=upstream \
+      scripts/sfw-audit.sh "{{BASE}}" "{{OUT}}"
+    echo "📄 Report: {{OUT}}/sfw-audit-report.md"
+    echo "📋 Manifest: {{OUT}}/sfw-manifest.json"
+
+# Run ledgrrr attestation on last audit manifest
+sfw-attest OUT="/tmp/sfw-audit":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    chmod +x scripts/ledgrrr-attest.sh
+    scripts/ledgrrr-attest.sh \
+      "{{OUT}}/sfw-manifest.json" \
+      "{{OUT}}/sfw-audit-report.md"
+
+# Full SFW pipeline: audit + attest
+sfw BASE="HEAD~1" OUT="/tmp/sfw-audit": (sfw-audit BASE OUT) (sfw-attest OUT)
+
+# Trigger manual SFW sync workflow via gh CLI
+sfw-sync-dispatch:
+    gh workflow run sfw-upstream-sync.yml \
+      --repo PromptExecution/__b00t__
+    echo "🚀 sfw-upstream-sync workflow dispatched"
+
+# Show current SFW state from LEDGRRR.md
+sfw-state:
+    #!/usr/bin/env bash
+    [[ -f LEDGRRR.md ]] || { echo "No LEDGRRR.md yet."; exit 0; }
+    grep -E "^\| [0-9]" LEDGRRR.md | tail -5 | \
+      awk -F'|' '{printf "Entry %s | %s | commit %s | PASS:%s SANITIZE:%s EXCLUDE:%s REVIEW:%s\n", $2,$3,$4,$6,$7,$8,$9}'
