@@ -62,14 +62,19 @@ cosign_sign() {
 
   if [[ -n "${COSIGN_PRIVATE_KEY:-}" ]]; then
     log "  cosign key-based signing: $artifact"
-    echo "$COSIGN_PRIVATE_KEY" > /tmp/cosign.key
+    # Use a secure temp file with restricted permissions; clean up with trap
+    local key_file
+    key_file="$(mktemp)"
+    chmod 600 "$key_file"
+    trap 'shred -u "$key_file" 2>/dev/null || rm -f "$key_file"' RETURN
+    printf '%s' "$COSIGN_PRIVATE_KEY" > "$key_file"
     cosign sign-blob \
-      --key /tmp/cosign.key \
+      --key "$key_file" \
       --output-signature "${artifact}.sig" \
       "$artifact" \
       && log "  ✅ cosign signature: ${artifact}.sig" \
       || log "  ⚠️  cosign sign-blob failed"
-    rm -f /tmp/cosign.key
+    # trap fires on RETURN — secure deletion of key file
   elif [[ -n "${GITHUB_TOKEN:-}" ]]; then
     log "  cosign keyless (OIDC) signing: $artifact"
     cosign sign-blob \
@@ -101,14 +106,28 @@ ledger_append() {
   local manifest_hash=""
   [[ -f "$MANIFEST" ]] && manifest_hash="$(sha256sum "$MANIFEST" | awk '{print $1}')"
 
-  # Read key fields from manifest
-  local upstream downstream mece_pass mece_exclude
-  upstream="$(python3 -c "import json,sys; d=json.load(open('$MANIFEST')); print(d.get('upstream','?'))" 2>/dev/null || echo '?')"
-  downstream="$(python3 -c "import json,sys; d=json.load(open('$MANIFEST')); print(d.get('downstream','?'))" 2>/dev/null || echo '?')"
-  mece_pass="$(python3 -c "import json,sys; d=json.load(open('$MANIFEST')); print(len(d['mece']['PASS']))" 2>/dev/null || echo '?')"
-  mece_sanitize="$(python3 -c "import json,sys; d=json.load(open('$MANIFEST')); print(len(d['mece']['SANITIZE']))" 2>/dev/null || echo '?')"
-  mece_exclude="$(python3 -c "import json,sys; d=json.load(open('$MANIFEST')); print(len(d['mece']['EXCLUDE']))" 2>/dev/null || echo '?')"
-  mece_review="$(python3 -c "import json,sys; d=json.load(open('$MANIFEST')); print(len(d['mece']['REVIEW']))" 2>/dev/null || echo '?')"
+  # Read ALL key fields from manifest in a single Python invocation
+  local manifest_fields
+  manifest_fields="$(python3 - <<PYEOF 2>/dev/null || echo "?	?	0	0	0	0"
+import json, sys
+try:
+    d = json.load(open("$MANIFEST"))
+    m = d.get("mece", {})
+    print("\t".join([
+        d.get("upstream", "?"),
+        d.get("downstream", "?"),
+        str(len(m.get("PASS", []))),
+        str(len(m.get("SANITIZE", []))),
+        str(len(m.get("EXCLUDE", []))),
+        str(len(m.get("REVIEW", []))),
+    ]))
+except Exception as e:
+    print(f"?\t?\t0\t0\t0\t0", file=sys.stderr)
+    sys.exit(1)
+PYEOF
+)"
+  IFS=$'\t' read -r upstream downstream mece_pass mece_sanitize mece_exclude mece_review \
+    <<< "$manifest_fields"
 
   # Bootstrap LEDGRRR.md if absent
   if [[ ! -f "$LEDGRRR_FILE" ]]; then

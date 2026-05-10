@@ -85,8 +85,11 @@ jobs:
       - name: Create SFW sync branch
         id: branch
         run: |
-          BRANCH="${{ env.SFW_BRANCH }}-${{ steps.upstream.outputs.sha && steps.upstream.outputs.sha || 'manual' }}"
-          BRANCH="${BRANCH:0:60}"  # GitHub branch name limit
+          SHA="${{ steps.upstream.outputs.sha }}"
+          # Use short SHA + timestamp suffix to guarantee uniqueness
+          SHORT_SHA="${SHA:0:8}"
+          TS="$(date -u +%Y%m%d%H%M%S)"
+          BRANCH="${{ env.SFW_BRANCH }}-${SHORT_SHA:-manual}-${TS}"
           git checkout -B "$BRANCH"
           echo "name=$BRANCH" >> "$GITHUB_OUTPUT"
           echo "Branch: $BRANCH"  # output: branch name
@@ -180,10 +183,10 @@ jobs:
           git commit -m "chore(sfw): sync from elasticdotventures/_b00t_ @ ${{ steps.upstream.outputs.sha }}
 
           MECE audit:
-          - PASS:     ${{ steps.audit.outputs.audit_pass }}
-          - SANITIZE: ${{ steps.audit.outputs.audit_sanitize }}
-          - EXCLUDE:  ${{ steps.audit.outputs.audit_exclude }}
-          - REVIEW:   ${{ steps.audit.outputs.audit_review }}
+          - PASS:     ${{ steps.audit.outputs.pass }}
+          - SANITIZE: ${{ steps.audit.outputs.sanitize }}
+          - EXCLUDE:  ${{ steps.audit.outputs.exclude }}
+          - REVIEW:   ${{ steps.audit.outputs.review }}
 
           Attestation: pending (see .sfw-audit/sfw-manifest.json)
           Signed-off-by: b00t-sfw-agent[bot] <sfw-agent@promptexecution.com>"
