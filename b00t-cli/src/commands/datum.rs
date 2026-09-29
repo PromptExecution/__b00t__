@@ -1118,7 +1118,21 @@ fn handle_validate(datum_path: &str, target: &str, strict: bool) -> Result<()> {
         }
     };
 
-    let outcome = compute_datum_validation(&b00t_table, filename, strict);
+    let mut outcome = compute_datum_validation(&b00t_table, filename, strict);
+
+    // #60: compute_datum_validation's hand-rolled field checks don't cover
+    // every field the real install path deserializes against -- a datum
+    // could pass every check here and still fail `b00t mcp install` with
+    // "Failed to parse MCP config TOML" (e.g. `[b00t.env]` as a table of
+    // tables, valid TOML, but not a valid HashMap<String, String>). Attempt
+    // the actual typed deserialization too, so `datum validate` can never
+    // report "valid" for something that doesn't actually install.
+    if let Err(e) = toml::from_str::<crate::config_types::UnifiedConfig>(&content) {
+        outcome
+            .errors
+            .push(format!("would fail to load for install/use: {e}"));
+    }
+
     print_validation_result(&outcome.errors, &outcome.warnings)?;
 
     // Route through the real Satisfies<C> / evidence-sink path (#927) —
