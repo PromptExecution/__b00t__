@@ -228,8 +228,15 @@ pub fn get_mcp_config(name: &str, path: &str) -> Result<BootDatum> {
         path_buf.display()
     ))?;
 
-    let mut config: UnifiedConfig =
-        toml::from_str(&content).context("Failed to parse MCP config TOML")?;
+    let mut config: UnifiedConfig = toml::from_str(&content).with_context(|| {
+        format!(
+            "Failed to parse MCP config TOML at {} — run with the printed \
+             toml::de::Error detail below to find the offending key/line \
+             (common cause: a field like [b00t.env] expects string values, \
+             not nested tables)",
+            path_buf.display()
+        )
+    })?;
     crate::datum_utils::apply_git_attributes_to_config(&mut config, &path_buf);
 
     Ok(config.b00t)

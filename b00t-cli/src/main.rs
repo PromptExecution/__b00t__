@@ -2407,13 +2407,13 @@ async fn main() {
     match &cli.command {
         Some(Commands::Tiktoken { text }) => {
             if let Err(e) = b00t_cli::commands::tiktoken::handle_tiktoken(text) {
-                eprintln!("Error: {}", e);
+                eprintln!("Error: {e:#}");
                 std::process::exit(1);
             }
         }
         Some(Commands::Mcp { mcp_command }) => {
             if let Err(e) = mcp_command.execute_async(&cli.path).await {
-                eprintln!("Error: {}", e);
+                eprintln!("Error: {e:#}");
                 std::process::exit(1);
             }
         }
@@ -2433,19 +2433,19 @@ async fn main() {
         }
         Some(Commands::Ai { ai_command }) => {
             if let Err(e) = ai_command.execute(&cli.path).await {
-                eprintln!("Error: {}", e);
+                eprintln!("Error: {e:#}");
                 std::process::exit(1);
             }
         }
         Some(Commands::Hive { hive_command }) => {
             if let Err(e) = b00t_cli::commands::hive::handle_hive_command(hive_command, &cli.path) {
-                eprintln!("Error: {}", e);
+                eprintln!("Error: {e:#}");
                 std::process::exit(1);
             }
         }
         Some(Commands::Stack { stack_command }) => {
             if let Err(e) = stack_command.execute(&cli.path) {
-                eprintln!("Error: {}", e);
+                eprintln!("Error: {e:#}");
                 std::process::exit(1);
             }
         }
@@ -2457,19 +2457,19 @@ async fn main() {
         }
         Some(Commands::Budget { budget_command }) => {
             if let Err(e) = budget_command.execute(&cli.path) {
-                eprintln!("Error: {}", e);
+                eprintln!("Error: {e:#}");
                 std::process::exit(1);
             }
         }
         Some(Commands::App { app_command }) => {
             if let Err(e) = app_command.execute(&cli.path) {
-                eprintln!("Error: {}", e);
+                eprintln!("Error: {e:#}");
                 std::process::exit(1);
             }
         }
         Some(Commands::Cli { cli_command }) => {
             if let Err(e) = cli_command.execute(&cli.path) {
-                eprintln!("Error: {}", e);
+                eprintln!("Error: {e:#}");
                 std::process::exit(1);
             }
         }
@@ -2478,7 +2478,7 @@ async fn main() {
                 command: bouncer_command.clone(),
             };
             if let Err(e) = b00t_cli::commands::bouncer::handle_bouncer(&args) {
-                eprintln!("Error: {}", e);
+                eprintln!("Error: {e:#}");
                 std::process::exit(1);
             }
         }
@@ -2487,19 +2487,19 @@ async fn main() {
                 b00t_cli::commands::config_cmd::handle_config_command(config_command, &cli.path)
                     .await
             {
-                eprintln!("Error: {}", e);
+                eprintln!("Error: {e:#}");
                 std::process::exit(1);
             }
         }
         Some(Commands::Ansible { ansible_command }) => {
             if let Err(e) = ansible_command.execute(&cli.path) {
-                eprintln!("Error: {}", e);
+                eprintln!("Error: {e:#}");
                 std::process::exit(1);
             }
         }
         Some(Commands::Model { model_command }) => {
             if let Err(e) = model_command.execute_async(&cli.path).await {
-                eprintln!("Error: {}", e);
+                eprintln!("Error: {e:#}");
                 std::process::exit(1);
             }
         }
@@ -2509,13 +2509,13 @@ async fn main() {
                 command: command.clone(),
             };
             if let Err(e) = check_cmd.execute(&cli.path) {
-                eprintln!("Error: {}", e);
+                eprintln!("Error: {e:#}");
                 std::process::exit(1);
             }
         }
         Some(Commands::Init { init_command }) => {
             if let Err(e) = init_command.execute(&cli.path) {
-                eprintln!("Error: {}", e);
+                eprintln!("Error: {e:#}");
                 std::process::exit(1);
             }
         }
@@ -2585,7 +2585,7 @@ async fn main() {
             } else if let Err(e) =
                 whoami::whoami(&cli.path, role.clone(), *with_skills, skills.clone(), *full)
             {
-                eprintln!("Error: {}", e);
+                eprintln!("Error: {e:#}");
                 std::process::exit(1);
             }
 
@@ -2597,7 +2597,7 @@ async fn main() {
             if *capabilities {
                 let filter = role.as_deref().map(|r| format!("agent/{}", r));
                 if let Err(e) = b00t_cli::whoami::discover_capabilities(filter.as_deref()) {
-                    eprintln!("Error: {}", e);
+                    eprintln!("Error: {e:#}");
                     std::process::exit(1);
                 }
             }
@@ -2607,7 +2607,7 @@ async fn main() {
                 Ok(0) => {}
                 Ok(code) => std::process::exit(code),
                 Err(e) => {
-                    eprintln!("Error: {}", e);
+                    eprintln!("Error: {e:#}");
                     std::process::exit(1);
                 }
             }
@@ -2617,19 +2617,19 @@ async fn main() {
             skip_tests,
         }) => {
             if let Err(e) = checkpoint(message.as_deref(), *skip_tests) {
-                eprintln!("Error: {}", e);
+                eprintln!("Error: {e:#}");
                 std::process::exit(1);
             }
         }
         Some(Commands::Soul { soul_command }) => {
             if let Err(e) = b00t_cli::commands::soul::handle_soul_command(soul_command) {
-                eprintln!("Error: {}", e);
+                eprintln!("Error: {e:#}");
                 std::process::exit(1);
             }
         }
         Some(Commands::Lifecycle { lifecycle_command }) => {
             if let Err(e) = b00t_cli::commands::lifecycle_cmd::handle_lifecycle_command(&lifecycle_command) {
-                eprintln!("Error: {}", e);
+                eprintln!("Error: {e:#}");
                 std::process::exit(1);
             }
         }
@@ -2637,13 +2637,13 @@ async fn main() {
             if let Err(e) =
                 b00t_cli::commands::skill::handle_skill_command(skill_command, &cli.path)
             {
-                eprintln!("Error: {}", e);
+                eprintln!("Error: {e:#}");
                 std::process::exit(1);
             }
         }
         Some(Commands::Whatismy { whatismy_command }) => {
             if let Err(e) = whatismy_command.execute(&cli.path) {
-                eprintln!("Error: {}", e);
+                eprintln!("Error: {e:#}");
                 std::process::exit(1);
             }
         }
@@ -2661,19 +2661,19 @@ async fn main() {
             available,
         }) => {
             if let Err(e) = show_status(&cli.path, filter.as_deref(), *installed, *available) {
-                eprintln!("Error: {}", e);
+                eprintln!("Error: {e:#}");
                 std::process::exit(1);
             }
         }
         Some(Commands::K8s { k8s_command }) => {
             if let Err(e) = k8s_command.execute(&cli.path) {
-                eprintln!("Error: {}", e);
+                eprintln!("Error: {e:#}");
                 std::process::exit(1);
             }
         }
         Some(Commands::Session { session_command }) => {
             if let Err(e) = session_command.execute(&cli.path) {
-                eprintln!("Error: {}", e);
+                eprintln!("Error: {e:#}");
                 std::process::exit(1);
             }
         }
@@ -2681,13 +2681,13 @@ async fn main() {
             if let Err(e) =
                 b00t_cli::commands::agent::handle_agent_command(agent_command.clone()).await
             {
-                eprintln!("Error: {}", e);
+                eprintln!("Error: {e:#}");
                 std::process::exit(1);
             }
         }
         Some(Commands::Job { job_command }) => {
             if let Err(e) = job_command.execute_async(&cli.path).await {
-                eprintln!("Error: {}", e);
+                eprintln!("Error: {e:#}");
                 std::process::exit(1);
             }
         }
@@ -2696,7 +2696,7 @@ async fn main() {
                 b00t_cli::commands::provider::handle_provider_command(provider_command.clone())
                     .await
             {
-                eprintln!("Error: {}", e);
+                eprintln!("Error: {e:#}");
                 std::process::exit(1);
             }
         }
@@ -2707,25 +2707,25 @@ async fn main() {
             )
             .await
             {
-                eprintln!("Error: {}", e);
+                eprintln!("Error: {e:#}");
                 std::process::exit(1);
             }
         }
         Some(Commands::Task { task_command }) => {
             if let Err(e) = b00t_cli::commands::task::handle_task_command(task_command.clone()) {
-                eprintln!("Error: {}", e);
+                eprintln!("Error: {e:#}");
                 std::process::exit(1);
             }
         }
         Some(Commands::Ooda { ooda_command }) => {
             if let Err(e) = b00t_cli::commands::ooda::handle_ooda(ooda_command.clone()).await {
-                eprintln!("Error: {}", e);
+                eprintln!("Error: {e:#}");
                 std::process::exit(1);
             }
         }
         Some(Commands::Chat { chat_command }) => {
             if let Err(e) = chat_command.execute().await {
-                eprintln!("Error: {}", e);
+                eprintln!("Error: {e:#}");
                 std::process::exit(1);
             }
         }
@@ -2734,35 +2734,35 @@ async fn main() {
         }
         Some(Commands::Learn(args)) => {
             if let Err(e) = handle_learn(&cli.path, args.clone()).await {
-                eprintln!("Error: {}", e);
+                eprintln!("Error: {e:#}");
                 std::process::exit(1);
             }
         }
         Some(Commands::Datum { datum_command }) => {
             use b00t_cli::commands::datum::handle_datum_command;
             if let Err(e) = handle_datum_command(&cli.path, datum_command).await {
-                eprintln!("Error: {}", e);
+                eprintln!("Error: {e:#}");
                 std::process::exit(1);
             }
         }
         Some(Commands::Justfile { justfile_command }) => {
             use b00t_cli::commands::justfile::handle_justfile_command;
             if let Err(e) = handle_justfile_command(justfile_command, &cli.path) {
-                eprintln!("Error: {}", e);
+                eprintln!("Error: {e:#}");
                 std::process::exit(1);
             }
         }
         Some(Commands::Grok { grok_command }) => {
             use b00t_cli::commands::grok::handle_grok_command;
             if let Err(e) = handle_grok_command(grok_command.clone()).await {
-                eprintln!("Error: {}", e);
+                eprintln!("Error: {e:#}");
                 std::process::exit(1);
             }
         }
         Some(Commands::Influence { influence_command }) => {
             use b00t_cli::commands::influence::handle_influence_command;
             if let Err(e) = handle_influence_command(influence_command) {
-                eprintln!("Error: {}", e);
+                eprintln!("Error: {e:#}");
                 std::process::exit(1);
             }
         }
@@ -3015,13 +3015,13 @@ async fn main() {
         }
         Some(Commands::Upgrade(args)) => {
             if let Err(e) = args.execute() {
-                eprintln!("Error: {}", e);
+                eprintln!("Error: {e:#}");
                 std::process::exit(1);
             }
         }
         Some(Commands::Up(args)) => {
             if let Err(e) = args.execute() {
-                eprintln!("Error: {}", e);
+                eprintln!("Error: {e:#}");
                 std::process::exit(1);
             }
         }
@@ -3030,19 +3030,19 @@ async fn main() {
             let filter_owned = filter.as_ref().map(|f| f.to_string());
             let effective_filter = role_owned.map(|r| format!("agent/{}", r)).or(filter_owned);
             if let Err(e) = whoami::discover_capabilities(effective_filter.as_deref()) {
-                eprintln!("Error: {}", e);
+                eprintln!("Error: {e:#}");
                 std::process::exit(1);
             }
         }
         Some(Commands::Version { version_command }) => {
             if let Err(e) = b00t_cli::commands::version::handle_version_command(version_command) {
-                eprintln!("Error: {}", e);
+                eprintln!("Error: {e:#}");
                 std::process::exit(1);
             }
         }
         Some(Commands::Ontology { ontology_command }) => {
             if let Err(e) = ontology_command.execute() {
-                eprintln!("Error: {}", e);
+                eprintln!("Error: {e:#}");
                 std::process::exit(1);
             }
         }
@@ -3072,13 +3072,13 @@ async fn main() {
         },
         Some(Commands::Viz { viz_command }) => {
             if let Err(e) = b00t_cli::commands::viz::handle_viz_command(&cli.path, viz_command) {
-                eprintln!("Error: {}", e);
+                eprintln!("Error: {e:#}");
                 std::process::exit(1);
             }
         }
         Some(Commands::Python { python_command }) => {
             if let Err(e) = python_command.execute(&cli.path) {
-                eprintln!("Error: {}", e);
+                eprintln!("Error: {e:#}");
                 std::process::exit(1);
             }
         }
@@ -3116,7 +3116,7 @@ async fn main() {
                     Some(lesson.as_str())
                 };
                 if let Err(e) = b00t_cli::commands::lfmf::handle_lfmf_stats(filter) {
-                    eprintln!("Error: {}", e);
+                    eprintln!("Error: {e:#}");
                     std::process::exit(1);
                 }
             // `lfmf advice <tool>` — retrieve prior lessons instead of recording.
@@ -3125,20 +3125,20 @@ async fn main() {
                 if let Err(e) =
                     b00t_cli::commands::lfmf::handle_lfmf_advice(&cli.path, &lesson, None).await
                 {
-                    eprintln!("Error: {}", e);
+                    eprintln!("Error: {e:#}");
                     std::process::exit(1);
                 }
             // `lfmf status <tool>` — cross-reference lesson-store health
             // (fail/skip counts, error rate, latest failure) for one tool.
             } else if tool == "status" {
                 if let Err(e) = b00t_cli::commands::lfmf::handle_lfmf_status(&lesson) {
-                    eprintln!("Error: {}", e);
+                    eprintln!("Error: {e:#}");
                     std::process::exit(1);
                 }
             } else if let Err(e) =
                 b00t_cli::commands::lfmf::handle_lfmf(&cli.path, &tool, &lesson, scope, *force).await
             {
-                eprintln!("Error: {}", e);
+                eprintln!("Error: {e:#}");
                 std::process::exit(1);
             }
         }
@@ -3146,7 +3146,7 @@ async fn main() {
             use b00t_cli::commands::bootstrap::handle_bootstrap_command;
 
             if let Err(e) = handle_bootstrap_command(bootstrap_command.clone(), &cli.path).await {
-                eprintln!("Error: {}", e);
+                eprintln!("Error: {e:#}");
                 std::process::exit(1);
             }
         }
@@ -3163,7 +3163,7 @@ async fn main() {
         }
         Some(Commands::Tutorial { tutorial_command }) => {
             if let Err(e) = tutorial_command.execute() {
-                eprintln!("Error: {}", e);
+                eprintln!("Error: {e:#}");
                 std::process::exit(1);
             }
         }
@@ -3261,14 +3261,14 @@ async fn main() {
                         json: *json,
                     };
                     if let Err(e) = handle_focus_command(&args) {
-                        eprintln!("Error: {}", e);
+                        eprintln!("Error: {e:#}");
                         std::process::exit(1);
                     }
                 }
                 ExperimentCommands::Compare { exp_a, exp_b, path } => {
                     use b00t_cli::commands::experiment;
                     if let Err(e) = experiment::handle_experiment_compare(exp_a, exp_b, path) {
-                        eprintln!("Error: {}", e);
+                        eprintln!("Error: {e:#}");
                         std::process::exit(1);
                     }
                 }
@@ -3276,25 +3276,25 @@ async fn main() {
         }
         Some(Commands::Focus(args)) => {
             if let Err(e) = b00t_cli::commands::focus::handle_focus_command(args) {
-                eprintln!("Error: {}", e);
+                eprintln!("Error: {e:#}");
                 std::process::exit(1);
             }
         }
         Some(Commands::Server(args)) => {
             if let Err(e) = b00t_cli::commands::server::handle_server_command(&args) {
-                eprintln!("Error: {}", e);
+                eprintln!("Error: {e:#}");
                 std::process::exit(1);
             }
         }
         Some(Commands::Pipeline(cmd)) => {
             if let Err(e) = b00t_cli::commands::pipeline::handle_pipeline_command(&cmd, &cli.path) {
-                eprintln!("Error: {}", e);
+                eprintln!("Error: {e:#}");
                 std::process::exit(1);
             }
         }
         Some(Commands::Secret(cmd)) => {
             if let Err(e) = b00t_cli::commands::secret::handle_secret_command(&cmd) {
-                eprintln!("Error: {}", e);
+                eprintln!("Error: {e:#}");
                 std::process::exit(1);
             }
         }
@@ -3302,31 +3302,31 @@ async fn main() {
             if let Err(e) =
                 b00t_cli::commands::capability_forge::handle_capability_forge_command(&cmd)
             {
-                eprintln!("Error: {}", e);
+                eprintln!("Error: {e:#}");
                 std::process::exit(1);
             }
         }
         Some(Commands::Stage(cmd)) => {
             if let Err(e) = b00t_cli::commands::stage::handle_stage_command(&cmd, &cli.path) {
-                eprintln!("Error: {}", e);
+                eprintln!("Error: {e:#}");
                 std::process::exit(1);
             }
         }
         Some(Commands::Store(args)) => {
             if let Err(e) = b00t_cli::commands::store::handle_store_command(&args).await {
-                eprintln!("Error: {}", e);
+                eprintln!("Error: {e:#}");
                 std::process::exit(1);
             }
         }
         Some(Commands::Exec(args)) => {
             if let Err(e) = b00t_cli::commands::exec::handle_exec(args, &cli.path) {
-                eprintln!("Error: {}", e);
+                eprintln!("Error: {e:#}");
                 std::process::exit(1);
             }
         }
         Some(Commands::Contract { contract_command }) => {
             if let Err(e) = b00t_cli::commands::contract::handle_contract_command(contract_command, &cli.path) {
-                eprintln!("Error: {}", e);
+                eprintln!("Error: {e:#}");
                 std::process::exit(1);
             }
         }
