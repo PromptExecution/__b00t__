@@ -267,6 +267,8 @@ pub enum RegistryAction {
     },
     #[clap(about = "Search for MCP servers by keyword or tag")]
     Search {
+        #[clap(help = "Keyword in name/description (shorthand for --keyword)")]
+        query: Option<String>,
         #[clap(long, help = "Search keyword in name/description")]
         keyword: Option<String>,
         #[clap(long, help = "Search by tag")]
@@ -1049,13 +1051,16 @@ impl RegistryAction {
                 }
                 Ok(())
             }
-            RegistryAction::Search { keyword, tag } => {
+            RegistryAction::Search { query, keyword, tag } => {
                 let results = if let Some(tag_val) = tag {
                     registry.search_by_tag(tag_val)
-                } else if let Some(kw) = keyword {
+                } else if let Some(kw) = keyword.as_ref().or(query.as_ref()) {
                     registry.search(kw)
                 } else {
-                    anyhow::bail!("Must provide --keyword or --tag");
+                    anyhow::bail!(
+                        "Must provide a search term, --keyword, or --tag \
+                         (e.g. `b00t mcp registry search chrome-devtools`)"
+                    );
                 };
 
                 println!("🔍 Search Results ({} matches):\n", results.len());
