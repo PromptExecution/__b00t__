@@ -2,13 +2,95 @@
 name = "playwright"
 type = "mcp"
 hint = "MCP server"
+lfmf_category = "playwright"
+
+# 🤓: @executeautomation/playwright-mcp-server drives real browsers via the
+# `playwright` npm package, which needs browser binaries (+ OS deps) present
+# to actually launch anything. This datum used to carry only
+# `[[b00t.mcp.stdio]]` (bare npx) with no `[b00t.install]` section, so
+# `b00t install --mcp=playwright` printed "No install command for
+# playwright.mcp, skipping" (confirmed 2026-09-29 against b00t-cli's
+# install_datum(), which skips any datum whose install_command_string() is
+# None) -- the MCP server got wired into Claude Code's config, but nothing
+# ever installed the browsers it needs to run.
+#
+# Two run paths now exist, picked by datum_mcp::McpDatum::select_best_method()
+# on priority (lower wins) + requires-gating:
+#   priority 0  -- podman run against mcr.microsoft.com/playwright, which
+#                  ships browsers pre-installed (zero host pollution).
+#                  Gated on `requires = ["podman"]`; datum_mcp.rs's
+#                  evaluate_method_constraints() only recognized "node",
+#                  "python", "docker", "internet" before 2026-09-29 and fell
+#                  through unrecognized constraints (including "podman") to
+#                  the default `_ => true` -- i.e. treated as always
+#                  satisfied even without podman installed. Fixed alongside
+#                  this datum.
+#   priority 10 -- bare npx, needs host browser binaries from
+#                  `playwright install`.
+# The container tag is resolved from the *installed* playwright version at
+# spawn/install time (not hardcoded), so the container and the host npx path
+# stay in lockstep. Verified 2026-09-29: mcr.microsoft.com/playwright
+# publishes `v<playwright-version>-noble` tags matching current npm
+# releases (e.g. v1.63.0-noble for playwright@1.63.0).
+#
+# 🤓: this host enforces the sm3lly shared-node protocol (2026-07-18) via an
+# OCI prestart hook (`/usr/local/bin/b00t-limits-hook`) that HARD-REJECTS
+# any podman container with no memory cap ("container has no memory cap...").
+# Confirmed 2026-09-29: a bare `podman run` (no --memory) against this same
+# image failed to start with exactly that error. `--memory`/`--memory-swap`
+# below is not an optimization, it's required for this stdio method to work
+# on a shared b00t node at all -- 2g matches the request tier gh-runner.hive.toml
+# uses for its own podman-backed workloads.
+[[b00t.mcp.stdio]]
+priority = 0
+command = "sh"
+args = ["-c", '''ver=$(npx -y playwright --version 2>/dev/null | sed "s/^Version //"); exec podman run -i --rm --memory=2g --memory-swap=2g "mcr.microsoft.com/playwright:v${ver}-noble" npx -y @executeautomation/playwright-mcp-server''']
+transport = "stdio"
+requires = ["podman", "node"]
+
+[[b00t.mcp.stdio]]
+priority = 10
+command = "npx"
+args = ["-y", "@executeautomation/playwright-mcp-server"]
+transport = "stdio"
+requires = ["node"]
+
+[b00t.install]
+command = '''
+if command -v podman >/dev/null 2>&1; then
+  ver=$(npx -y playwright --version 2>/dev/null | sed "s/^Version //")
+  podman pull "mcr.microsoft.com/playwright:v${ver}-noble"
+else
+  npx -y playwright install --with-deps
+fi
+'''
 
 [[b00t.gate]]
 command = "npx"
 
-[[b00t.mcp.stdio]]
-transport = "stdio"
-args = ["-y", "@executeautomation/playwright-mcp-server"]
-priority = 0
-requires = ["node"]
-command = "npx"
+[[b00t.usage]]
+description = "Warm the podman image (browsers pre-installed) matching the current playwright npm version"
+command = "podman pull mcr.microsoft.com/playwright:v$(npx -y playwright --version | sed 's/^Version //')-noble"
+
+[[b00t.usage]]
+description = "Or install browser binaries + OS deps directly on the host (used when podman is unavailable)"
+command = "npx -y playwright install --with-deps"
+
+[[b00t.references]]
+name = "executeautomation/playwright-mcp-server"
+url = "https://github.com/executeautomation/mcp-playwright"
+
+[[b00t.references]]
+name = "Microsoft Playwright container images"
+url = "https://mcr.microsoft.com/en-us/product/playwright/about"
+
+[[b00t.references]]
+name = "Model Context Protocol"
+url = "https://modelcontextprotocol.io"
+
+# b00t:map v1
+# summary: Playwright browser automation via MCP -- podman (browsers baked in) preferred, npx/host fallback
+# tags: mcp, playwright, browser, podman, e2e, testing
+# tier: ch0nky
+# cmds: npx -y playwright install --with-deps, podman pull mcr.microsoft.com/playwright:v<ver>-noble
+# complexity: 4
