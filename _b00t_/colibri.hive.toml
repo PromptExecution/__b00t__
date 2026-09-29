@@ -1,0 +1,224 @@
+[b00t]
+name = "colibri"
+type = "hive"
+hint = "Local small-LM inference — podman kube play pod template. justvugg/colibri OLMoE (1B active / 7B total, CPU-only, int8), OpenAI-compatible API. Zero host/repo data in source."
+
+# 🤓 2026-09-29: kr0ki's existing local-LLM path (b00t-inference.container.toml,
+# llama.cpp + Qwen2.5-0.5B) was found crash-looping — the GGUF was missing from
+# the node's HF cache entirely (see kr0ki memory: ch0nky_inference_broken).
+# colibri is a second, independently-provisioned local backend for the same
+# OpenAI-compatible slot (OPENAI_API_URL/OPENAI_API_KEY, consumed by both
+# kr0ki-server's health check and containers/kr0ki-storyb00k-agent/llm_client.py's
+# discover_model()) — not a replacement in source, an alternative to install
+# when ch0nky is down. CPU-only, no GPU required (family_registry.py: olmoe
+# supports_accelerator=False).
+#
+# Model: pre-converted, ready-to-mount weights —
+# https://huggingface.co/Krishal/OLMoE-1B-7B-0125-Instruct-Colibri (~7GB,
+# instruct-tuned). No local conversion step, unlike colibri's larger
+# families (those need c/tools/convert_*.py, which needs a torch checkout).
+#
+# 🚩 THREE bugs found and fixed getting this working, verified live end-to-end
+#    (real /v1/chat/completions response, "Banana", 2026-09-29) — all three
+#    are load-bearing, not just tuning:
+#
+# 1. docker/Dockerfile.slim's `make -C c colibri` target is a literal alias
+#    for `glm` (c/Makefile:753-757) and the image sets COLI_ENGINE=/app/colibri
+#    + COLI_DOCKER_GLM_ONLY=1, which makes coli's engine_for() hard-fail for
+#    any non-GLM family: "this image contains only the GLM engine; OLMoE
+#    needs a full release archive or source build" (coli:343-350). OLMoE has
+#    its own file-target rule (`olmoe$(EXE): olmoe.c ...`, Makefile:1114) not
+#    aliased into `colibri` — needs its own build (embedded below as
+#    Dockerfile.olmoe: build target `olmoe`, binary copied to /app/olmoe not
+#    /app/colibri, COLI_ENGINE left UNSET so coli's family.engine_artifact
+#    lookup — HERE/<name> — finds it directly, coli:352-355).
+#
+# 2. ARCH defaults to x86-64-v3 (requires AVX2). This host's real CPU is an
+#    Intel i5-3570 (Ivy Bridge, 2012) — has AVX but NOT AVX2/BMI/FMA. A
+#    x86-64-v3 build loads and reports `info` fine (that path never executes
+#    a SIMD kernel) but SIGILLs the instant the engine actually runs
+#    inference, surfacing only as "colibri engine exited unexpectedly" from
+#    openai_server.py's generic subprocess-exit check — no signal name, no
+#    hint. Build with `--build-arg ARCH=native` (or `x86-64` for a portable
+#    scalar-fallback binary if this image will run on a different host).
+#    `grep -o avx2 /proc/cpuinfo` (empty = SIGILL risk) is the fast check.
+#
+# 3. `coli serve` binds 127.0.0.1:8000 by DEFAULT even with no flags (despite
+#    docker/README.md's port-5000 examples) — pass --port explicitly. And it
+#    outright REFUSES to bind 0.0.0.0 without either COLI_API_KEY set or
+#    COLI_ALLOW_INSECURE_BIND=1 ("refusing to bind 0.0.0.0 beyond localhost
+#    without COLI_API_KEY set"). Use COLI_API_KEY (real bearer-token auth,
+#    checked by the server) — COLI_ALLOW_INSECURE_BIND=1 disables the
+#    DNS-rebinding Host-header guard outright and should be a last resort,
+#    not the default here.
+#
+# 🚩 UNRESOLVED — do not attempt to install/deploy the pod on this host
+#    without reading this first:
+#
+#    `podman kube play` is unconditionally broken on this host by a
+#    DIFFERENT, pre-existing bug: b00t task #4 ("b00t-limits-hook exits 1
+#    and blocks rootless podman kube play for kr0ki-local"). Root-caused
+#    2026-09-29: every `podman kube play` pod gets an auto-generated
+#    infra/pause container (entrypoint `catatonit -P`) holding only the
+#    pod's network/IPC namespaces. It is not reachable from the pod's own
+#    YAML — no k8s `resources.limits` block targets it, and a pod-level
+#    `metadata.annotations` entry does NOT propagate to its OCI annotations
+#    (verified live) — so the b00t-limits-hook (source:
+#    _b00t_/podman/b00t-limits-hook.sh, installed at
+#    /usr/local/bin/b00t-limits-hook) rejects it for having no memory cap,
+#    before the real (correctly-capped) workload container is even
+#    attempted. This blocks EVERY podman-kube-play pod on this host, not
+#    just this one. A fix (skip the cap check when
+#    process.args == ["/catatonit", "-P"]) is designed but NOT applied —
+#    editing that file was blocked by this session's safety policy (it's a
+#    shared security-enforcement control, editing it flags as
+#    security-weakening even for the git-tracked source). An operator needs
+#    to apply and install it. Until then, run colibri via plain
+#    `podman run --memory=...` (see verified recipe below) — that path
+#    already satisfies the hook correctly and is what was actually used to
+#    get the live "Banana" response above.
+
+[b00t.hive]
+template = true
+description = "justvugg/colibri OLMoE inference server — podman kube play pod (blocked, see above; podman run works today)"
+runtime = "podman-kube-play"
+
+[b00t.hive.resources]
+# OLMoE int8 is ~7GB resident; --ram below reserves the engine's expert
+# cache within the container's memory limit, not a hard ceiling on its own.
+ram_gb = 10
+cpu_cores = 4
+gpu_mb = 0
+
+[b00t.hive.resources.gate]
+ram_free_gb = 10
+gpu_free_mb = 0
+
+[b00t.hive.exclusion]
+group = "colibri"
+priority = 10
+
+# ── Embedded Dockerfile: OLMoE-only build (see bug #1 above) ───────
+# Build from a colibri source checkout:
+#   podman build -t localhost/colibri:latest -f Dockerfile.olmoe \
+#       --build-arg ARCH=native <colibri-src-checkout>
+[b00t.hive.dockerfile_olmoe]
+content = """
+FROM debian:stable-slim AS build
+ARG ARCH=native
+RUN apt-get update && \\
+    apt-get install -y --no-install-recommends build-essential make && \\
+    rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY c/ ./c/
+RUN make -C c olmoe ARCH=${ARCH}
+
+FROM debian:stable-slim
+RUN apt-get update && \\
+    apt-get install -y --no-install-recommends python3 libgomp1 && \\
+    rm -rf /var/lib/apt/lists/* && \\
+    useradd -m -u 1000 colibri
+WORKDIR /app
+
+# olmoe binary lands at /app/olmoe (not /app/colibri) so coli's
+# family.engine_artifact lookup (HERE/<name>) finds it without COLI_ENGINE.
+COPY --from=build /src/c/olmoe             ./olmoe
+COPY c/coli c/version.py c/openai_server.py c/v4_dsml.py c/v41_dsml.py c/family_registry.py c/resource_plan.py c/doctor.py c/autotune.py ./
+COPY c/tools/ ./tools/
+
+ENV COLI_MODEL=/model \\
+    PYTHONUNBUFFERED=1
+VOLUME ["/model"]
+EXPOSE 5000
+
+USER colibri
+ENTRYPOINT ["python3", "/app/coli"]
+CMD ["info"]
+"""
+
+# ── Embedded podman kube YAML template (BLOCKED — see above) ───────
+# Placeholders: {{model_dir}}, {{ram_gb}}, {{api_key}}
+[b00t.hive.kube_yaml]
+content = """
+apiVersion: v1
+kind: Pod
+metadata:
+  name: colibri
+  labels:
+    app: colibri
+spec:
+  restartPolicy: OnFailure
+  containers:
+  - name: colibri
+    image: localhost/colibri:latest
+    args:
+    - serve
+    - --host
+    - 0.0.0.0
+    - --port
+    - "5000"
+    - --ram
+    - "{{ram_gb}}"
+    env:
+    - name: COLI_API_KEY
+      value: "{{api_key}}"
+    ports:
+    - containerPort: 5000
+      hostPort: 5000
+    volumeMounts:
+    - name: model
+      mountPath: /model
+      readOnly: true
+    resources:
+      requests:
+        memory: "8Gi"
+        cpu: "2"
+      limits:
+        memory: "10Gi"
+        cpu: "4"
+    securityContext:
+      runAsNonRoot: true
+      runAsUser: 1000
+      allowPrivilegeEscalation: false
+  volumes:
+  - name: model
+    hostPath:
+      path: {{model_dir}}
+      type: Directory
+"""
+
+[b00t.env]
+# Runtime config — filled at install time, never committed
+# COLIBRI_MODEL_DIR = ""
+# COLIBRI_API_KEY = ""
+
+[[b00t.usage]]
+description = "Build the OLMoE image (native ARCH — check /proc/cpuinfo for avx2 first; use x86-64 instead if this image needs to run on a different/older host)"
+command = "git clone https://github.com/JustVugg/colibri.git /tmp/colibri-src && podman build -t localhost/colibri:latest -f Dockerfile.olmoe --build-arg ARCH=native /tmp/colibri-src"
+
+[[b00t.usage]]
+description = "Fetch the pre-converted OLMoE weights (~7GB, no local conversion needed)"
+command = "hf download Krishal/OLMoE-1B-7B-0125-Instruct-Colibri --local-dir ~/.cache/colibri/models/olmoe"
+
+[[b00t.usage]]
+description = "VERIFIED WORKING today: run directly via podman (kube play is blocked, see note above)"
+command = "podman run -d --name colibri --memory=10g --memory-swap=10g -v ~/.cache/colibri/models/olmoe:/model:ro -p 127.0.0.1:5000:5000 -e COLI_API_KEY=$COLIBRI_API_KEY localhost/colibri:latest serve --host 0.0.0.0 --port 5000 --ram 8"
+
+[[b00t.usage]]
+description = "Point kr0ki-server / kr0ki-storyb00k-agent at it (OpenAI-compatible)"
+command = "export OPENAI_API_URL=http://localhost:5000/v1 OPENAI_API_KEY=$COLIBRI_API_KEY"
+
+[[b00t.references]]
+name = "justvugg/colibri"
+url = "https://github.com/JustVugg/colibri"
+
+[[b00t.references]]
+name = "OLMoE-1B-7B-0125-Instruct-Colibri (pre-converted weights)"
+url = "https://huggingface.co/Krishal/OLMoE-1B-7B-0125-Instruct-Colibri"
+
+# b00t:map v1
+# summary: Local small-LM inference (OLMoE, CPU-only, OpenAI-compat) — verified working via podman run; podman-kube-play blocked on b00t task #4
+# tags: hive, colibri, llm, inference, template, podman, kube-play, yaml, placeholder, local-first, blocked
+# tier: ch0nky
+# cmds: podman run ... localhost/colibri:latest serve --host 0.0.0.0 --port 5000 --ram 8
+# complexity: 5
