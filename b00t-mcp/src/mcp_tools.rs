@@ -2,8 +2,9 @@ use crate::clap_reflection::{McpCommandRegistry, McpExecutor, McpReflection};
 use crate::impl_mcp_tool;
 use crate::tools::pipeline::BPipelineCommand;
 use anyhow::Result;
+use b00t_council::MessageSink;
 use clap::Parser;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use std::collections::HashMap;
 // use b00t_c0re_lib::GrokClient;
 
@@ -359,6 +360,12 @@ impl crate::clap_reflection::McpExecutor for AgentMessageCommand {
             .and_then(|v| v.as_str())
             .unwrap_or("message");
 
+        record_message(
+            &caller_agent_id(),
+            b00t_council::Recipient::Direct(to_agent.to_string()),
+            serde_json::json!({"subject": subject, "content": content}),
+        );
+
         let rt = tokio::runtime::Runtime::new()?;
         rt.block_on(async {
             let client = get_nats_client().await?;
@@ -546,20 +553,63 @@ impl crate::clap_reflection::McpExecutor for AgentVoteCreateCommand {
             .get("description")
             .and_then(|v| v.as_str())
             .unwrap_or("");
+        let vote_type = params
+            .get("vote_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let deadline_minutes = params.get("deadline").and_then(|v| v.as_u64()).unwrap_or(0);
+        let voters: Vec<String> = params
+            .get("voters")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
 
+        // `options` arrives as a JSON array (per the tool's own help text);
+        // fall back to a single literal option if it isn't valid JSON so a
+        // caller passing a bare string doesn't just fail outright.
+        let raw_options = params
+            .get("options")
+            .and_then(|v| v.as_str())
+            .unwrap_or("[]");
+        let options: Vec<String> = serde_json::from_str(raw_options)
+            .unwrap_or_else(|_| vec![raw_options.to_string()]);
+
+        let proposal = b00t_council::Proposal {
+            id: uuid::Uuid::new_v4().to_string(),
+            subject: subject.to_string(),
+            options,
+            quorum: quorum_for_vote_type(vote_type),
+            deadline: (deadline_minutes > 0)
+                .then(|| chrono::Utc::now() + chrono::Duration::minutes(deadline_minutes as i64)),
+            eligible_voters: voters,
+        };
+
+        record_message(
+            &caller_agent_id(),
+            b00t_council::Recipient::Channel(proposal.id.clone()),
+            serde_json::json!({"kind": "proposal", "description": description, "proposal": proposal}),
+        );
+
+        let proposal_id = proposal.id.clone();
         let rt = tokio::runtime::Runtime::new()?;
         rt.block_on(async {
             let client = get_nats_client().await?;
             let notification = NotificationMessage::new(
                 "vote",
                 "create",
-                serde_json::json!({"subject": subject, "description": description}),
+                serde_json::json!({"proposal_id": proposal_id, "subject": subject, "description": description}),
             );
             client
                 .publish_notification(&notification)
                 .await
                 .map_err(|e| anyhow::anyhow!("Failed to create vote: {}", e))?;
-            Ok(format!("Vote created: {}", subject))
+            Ok(format!(
+                "Vote created: {} (proposal_id={}) — submit with agent_vote_submit, resolve with agent_vote_tally",
+                subject, proposal_id
+            ))
         })
     }
 }
@@ -601,6 +651,17 @@ impl crate::clap_reflection::McpExecutor for AgentVoteSubmitCommand {
             .and_then(|v| v.as_str())
             .unwrap_or("unknown");
         let vote = params.get("vote").and_then(|v| v.as_str()).unwrap_or("");
+        let reasoning = params
+            .get("reasoning")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let voter = caller_agent_id();
+
+        record_message(
+            &voter,
+            b00t_council::Recipient::Channel(proposal_id.to_string()),
+            serde_json::json!({"kind": "vote", "voter": voter, "choice": vote, "reasoning": reasoning}),
+        );
 
         let rt = tokio::runtime::Runtime::new()?;
         rt.block_on(async {
@@ -614,8 +675,116 @@ impl crate::clap_reflection::McpExecutor for AgentVoteSubmitCommand {
                 .publish_notification(&notification)
                 .await
                 .map_err(|e| anyhow::anyhow!("Failed to submit vote: {}", e))?;
-            Ok(format!("Vote submitted for proposal {}", proposal_id))
+            Ok(format!(
+                "Vote submitted for proposal {} — check outcome with agent_vote_tally",
+                proposal_id
+            ))
         })
+    }
+}
+
+/// MCP command for tallying a vote — replays the durable message log for a
+/// proposal's `Channel(proposal_id)` traffic and resolves it via
+/// `b00t_council::tally`. This is the fix for the two stub tools above: a
+/// vote now has an actual, checkable outcome instead of two indistinguishable
+/// NATS notifications.
+#[derive(Parser, Clone)]
+pub struct AgentVoteTallyCommand {
+    #[arg(help = "Proposal ID")]
+    pub proposal_id: String,
+}
+
+impl crate::clap_reflection::McpReflection for AgentVoteTallyCommand {
+    fn mcp_tool_name() -> String {
+        "agent_vote_tally".to_string()
+    }
+    fn command_path() -> Vec<String> {
+        vec![
+            "agent".to_string(),
+            "vote".to_string(),
+            "tally".to_string(),
+        ]
+    }
+}
+
+impl crate::clap_reflection::McpExecutor for AgentVoteTallyCommand {
+    fn execute_mcp_call(
+        params: &std::collections::HashMap<String, serde_json::Value>,
+    ) -> anyhow::Result<String> {
+        let proposal_id = params
+            .get("proposal_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+
+        let envelopes = message_sink()
+            .replay(&b00t_council::ReplayFilter::channel(proposal_id))
+            .map_err(|e| anyhow::anyhow!("Failed to replay message log: {}", e))?;
+
+        let mut proposal: Option<b00t_council::Proposal<String>> = None;
+        let mut ballots: Vec<(String, b00t_council::Ballot<String>)> = Vec::new();
+
+        for env in &envelopes {
+            let kind = env.body.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+            match kind {
+                "proposal" => {
+                    if let Some(p) = env.body.get("proposal") {
+                        if let Ok(p) = serde_json::from_value::<b00t_council::Proposal<String>>(p.clone()) {
+                            proposal = Some(p);
+                        }
+                    }
+                }
+                "vote" => {
+                    let voter = env
+                        .body
+                        .get("voter")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(&env.from)
+                        .to_string();
+                    let choice = env.body.get("choice").and_then(|v| v.as_str()).unwrap_or("");
+                    let ballot = if choice.eq_ignore_ascii_case("veto") {
+                        b00t_council::Ballot::Veto { alternative: None }
+                    } else if choice.eq_ignore_ascii_case("abstain") {
+                        b00t_council::Ballot::Abstain
+                    } else {
+                        b00t_council::Ballot::Cast(choice.to_string())
+                    };
+                    ballots.push((voter, ballot));
+                }
+                _ => {}
+            }
+        }
+
+        let Some(proposal) = proposal else {
+            return Ok(format!(
+                "No proposal found for {} — has agent_vote_create been called for it?",
+                proposal_id
+            ));
+        };
+
+        let outcome = b00t_council::tally(&proposal.options, &ballots, &proposal.quorum);
+        let breakdown: std::collections::HashMap<&str, usize> =
+            ballots.iter().fold(std::collections::HashMap::new(), |mut acc, (_, b)| {
+                let key = match b {
+                    b00t_council::Ballot::Cast(o) => o.as_str(),
+                    b00t_council::Ballot::Veto { .. } => "veto",
+                    b00t_council::Ballot::Abstain => "abstain",
+                };
+                *acc.entry(key).or_insert(0) += 1;
+                acc
+            });
+
+        let outcome_str = match &outcome {
+            b00t_council::Outcome::Passed(option) => format!("Passed({option})"),
+            b00t_council::Outcome::Rejected => "Rejected".to_string(),
+            b00t_council::Outcome::Pending => "Pending".to_string(),
+        };
+
+        Ok(format!(
+            "Proposal {} ({}): {outcome_str} — {} ballots cast, breakdown: {breakdown:?}",
+            proposal_id,
+            proposal.subject,
+            ballots.len(),
+        ))
     }
 }
 
@@ -704,7 +873,9 @@ impl crate::clap_reflection::McpExecutor for DelegateDatumCommand {
                 .unwrap_or_default()
                 .as_secs();
             eprintln!("[b00t_delegate] LEDGERR_MCP_CMD unset — using local gate fallback");
-            eprintln!("[b00t_delegate] datum={datum_id} agent={agent_id} task={task_id} cost={estimated_cost_cake:.4} 🍰 → local-authorized");
+            eprintln!(
+                "[b00t_delegate] datum={datum_id} agent={agent_id} task={task_id} cost={estimated_cost_cake:.4} 🍰 → local-authorized"
+            );
             return Ok(serde_json::to_string_pretty(&json!({
                 "authorized": true,
                 "datum_id": datum_id,
@@ -962,6 +1133,12 @@ impl crate::clap_reflection::McpExecutor for AgentNotifyCommand {
             .get("details")
             .map(|v| v.clone())
             .unwrap_or(serde_json::Value::Null);
+
+        record_message(
+            source,
+            b00t_council::Recipient::Broadcast,
+            serde_json::json!({"event_type": event_type, "details": details}),
+        );
 
         let rt = tokio::runtime::Runtime::new()?;
         rt.block_on(async {
@@ -1274,6 +1451,28 @@ impl_mcp_tool!(
 pub struct GrokStatusCommand;
 
 impl_mcp_tool!(GrokStatusCommand, "grok_status", ["grok", "status"]);
+
+/// Random walk through the knowledge graph — surfaces unexpected connections
+/// 🤓 ENTANGLED: b00t-cli/src/commands/grok.rs GrokCommands::Wander
+/// 🤓 #247: gap identified vs Cortex's 44-tool ideation (no exploratory
+///    traversal existed — `ontology sparql` is targeted-query only).
+/// 🤓 No required fields — zero-friction serendipity by design, per the
+///    Reddit post's own lesson: "more than three required fields, nobody
+///    will call it voluntarily."
+#[derive(Parser, Clone)]
+pub struct GrokWanderCommand {
+    #[arg(long, help = "Restrict wandering to one topic (default: random)")]
+    pub topic: Option<String>,
+
+    #[arg(
+        long,
+        default_value = "both",
+        help = "RAG: raglite | irontology | both"
+    )]
+    pub rag: Option<String>,
+}
+
+impl_mcp_tool!(GrokWanderCommand, "grok_wander", ["grok", "wander"]);
 
 // ACP Hive coordination MCP tools
 
@@ -1648,6 +1847,128 @@ pub struct TaskUpdateCommand {
 }
 impl_mcp_tool!(TaskUpdateCommand, "task_update", ["task", "update"], positionals: ["id"]);
 
+/// List registered justfile datums and recipe counts
+#[derive(Parser, Clone)]
+pub struct JustfileListCommand {
+    #[arg(long, help = "Output as JSON")]
+    pub json: bool,
+}
+impl_mcp_tool!(JustfileListCommand, "justfile_list", ["justfile", "list"]);
+
+/// Query recipes for a registered justfile datum
+#[derive(Parser, Clone)]
+pub struct JustfileQueryCommand {
+    #[arg(help = "Justfile datum name")]
+    pub name: String,
+    #[arg(long, help = "Filter recipe names/docs/dependencies by substring")]
+    pub recipe: Option<String>,
+    #[arg(long, help = "Output as JSON")]
+    pub json: bool,
+}
+impl_mcp_tool!(JustfileQueryCommand, "justfile_query", ["justfile", "query"], positionals: ["name"]);
+
+/// Validate a registered justfile datum through just's AST parser
+#[derive(Parser, Clone)]
+pub struct JustfileValidateCommand {
+    #[arg(help = "Justfile datum name")]
+    pub name: String,
+}
+impl_mcp_tool!(JustfileValidateCommand, "justfile_validate", ["justfile", "validate"], positionals: ["name"]);
+
+/// Emit registered justfile paths for strict just-mcp startup
+#[derive(Parser, Clone)]
+pub struct JustfileRegistryCommand {
+    #[arg(long, default_value = "args", help = "Output format: args|lines|json")]
+    pub format: String,
+}
+impl_mcp_tool!(
+    JustfileRegistryCommand,
+    "justfile_registry",
+    ["justfile", "registry"]
+);
+
+/// Run a recipe from a registered justfile datum
+#[derive(Parser, Clone)]
+pub struct JustfileRunCommand {
+    #[arg(help = "Justfile datum name")]
+    pub name: String,
+    #[arg(help = "Recipe name")]
+    pub recipe: String,
+    #[arg(long, help = "Additional recipe arguments")]
+    pub args: Vec<String>,
+}
+
+impl McpReflection for JustfileRunCommand {
+    fn mcp_tool_name() -> String {
+        "justfile_run".to_string()
+    }
+
+    fn command_path() -> Vec<String> {
+        vec!["justfile".to_string(), "run".to_string()]
+    }
+
+    fn generate_json_schema() -> Map<String, Value> {
+        let mut schema = Map::new();
+        let mut properties = Map::new();
+        schema.insert("type".to_string(), json!("object"));
+        properties.insert(
+            "name".to_string(),
+            json!({"type": "string", "description": "Justfile datum name"}),
+        );
+        properties.insert(
+            "recipe".to_string(),
+            json!({"type": "string", "description": "Recipe name"}),
+        );
+        properties.insert(
+            "args".to_string(),
+            json!({"type": "array", "items": {"type": "string"}, "description": "Additional recipe arguments"}),
+        );
+        schema.insert("properties".to_string(), Value::Object(properties));
+        schema.insert("required".to_string(), json!(["name", "recipe"]));
+        schema
+    }
+}
+
+impl McpExecutor for JustfileRunCommand {
+    fn execute_mcp_call(params: &HashMap<String, Value>) -> Result<String> {
+        let name = params
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("name is required"))?;
+        let recipe = params
+            .get("recipe")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("recipe is required"))?;
+
+        let mut all_args = Self::command_path();
+        all_args.push(name.to_string());
+        all_args.push(recipe.to_string());
+        if let Some(extra) = params.get("args") {
+            match extra {
+                Value::Array(items) => {
+                    for item in items {
+                        all_args.push(item.as_str().unwrap_or("").to_string());
+                    }
+                }
+                Value::String(item) if !item.is_empty() => all_args.push(item.clone()),
+                _ => {}
+            }
+        }
+
+        let output = std::process::Command::new("b00t-cli")
+            .args(&all_args)
+            .output()
+            .map_err(|e| anyhow::anyhow!("Failed to execute b00t-cli: {}", e))?;
+
+        if output.status.success() {
+            Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("b00t-cli command failed: {}", stderr)
+        }
+    }
+}
+
 // ── Autodiscovery Proxy ──────────────────────────────────────────────────────
 // 🤓 54 tools hidden here; agent discovers via b00t_discover, executes via b00t_exec
 // Sub-agents receive only 5 surface tools → lean context, sandboxed capability
@@ -1771,6 +2092,31 @@ pub static TOOL_CATALOG: &[ToolCatalogEntry] = &[
         subcommand: "agent progress",
     },
     ToolCatalogEntry {
+        name: "justfile_list",
+        description: "List registered justfile modules and recipe counts",
+        subcommand: "justfile list",
+    },
+    ToolCatalogEntry {
+        name: "justfile_query",
+        description: "Query registered recipes by justfile module",
+        subcommand: "justfile query",
+    },
+    ToolCatalogEntry {
+        name: "justfile_validate",
+        description: "Validate a registered justfile through just AST",
+        subcommand: "justfile validate",
+    },
+    ToolCatalogEntry {
+        name: "justfile_registry",
+        description: "Emit strict just-mcp --allow registry from justfile datums",
+        subcommand: "justfile registry",
+    },
+    ToolCatalogEntry {
+        name: "justfile_run",
+        description: "Run a recipe from a registered justfile module",
+        subcommand: "justfile run",
+    },
+    ToolCatalogEntry {
         name: "b00t_agent_complete",
         description: "Mark agent task complete",
         subcommand: "agent complete",
@@ -1784,6 +2130,11 @@ pub static TOOL_CATALOG: &[ToolCatalogEntry] = &[
         name: "b00t_agent_vote_submit",
         description: "Submit a vote",
         subcommand: "agent vote submit",
+    },
+    ToolCatalogEntry {
+        name: "b00t_agent_vote_tally",
+        description: "Resolve a vote's outcome from the durable message log",
+        subcommand: "agent vote tally",
     },
     ToolCatalogEntry {
         name: "b00t_session_init",
@@ -1885,6 +2236,26 @@ pub static TOOL_CATALOG: &[ToolCatalogEntry] = &[
         description: "Manage pipeline lifecycle — list, run, validate, inspect, cost",
         subcommand: "pipeline",
     },
+    ToolCatalogEntry {
+        name: "b00t_just",
+        description: "Run a registered just recipe through a typed recipe-and-args contract",
+        subcommand: "just",
+    },
+    ToolCatalogEntry {
+        name: "b00t_store_init",
+        description: "Initialise the knowledge store",
+        subcommand: "store init",
+    },
+    ToolCatalogEntry {
+        name: "b00t_store_status",
+        description: "Show store status (backend, objects, bytes)",
+        subcommand: "store status",
+    },
+    ToolCatalogEntry {
+        name: "b00t_store_validate",
+        description: "Cross-engine consistency check",
+        subcommand: "store validate",
+    },
 ];
 
 /// Search TOOL_CATALOG by keyword (case-insensitive substring match on name + description)
@@ -1931,7 +2302,14 @@ impl crate::clap_reflection::McpExecutor for BExecCommand {
             .get("argv")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("b00t_exec requires argv: string"))?;
-        let parts: Vec<&str> = argv.split_whitespace().collect();
+        let parts: Vec<String> = shlex::split(argv).ok_or_else(|| {
+            anyhow::anyhow!(
+                "b00t_exec: invalid argv quoting (unterminated quote or trailing backslash) in: {argv}"
+            )
+        })?;
+        if parts.is_empty() {
+            anyhow::bail!("b00t_exec: argv must not be empty");
+        }
         let output = std::process::Command::new("b00t-cli")
             .args(&parts)
             .output()
@@ -1944,7 +2322,65 @@ impl crate::clap_reflection::McpExecutor for BExecCommand {
     }
 }
 
-// BVerifyCommand: verify z3 assertion via b00t-cli admin
+// ── Surface Tool: b00t_just ──────────────────────────────────────────────────
+/// Execute a registered just recipe without routing through generic argv or a shell.
+#[derive(Parser, Clone)]
+pub struct BJustCommand {
+    #[arg(help = "Registered just recipe name, e.g. 'game-play::test'")]
+    pub just: String,
+    #[arg(long, help = "Optional recipe arguments, passed without shell parsing")]
+    pub args: Vec<String>,
+}
+impl crate::clap_reflection::McpReflection for BJustCommand {
+    fn mcp_tool_name() -> String {
+        "b00t_just".to_string()
+    }
+    fn command_path() -> Vec<String> {
+        vec![]
+    }
+}
+impl crate::clap_reflection::McpExecutor for BJustCommand {
+    fn execute_mcp_call(
+        params: &std::collections::HashMap<String, serde_json::Value>,
+    ) -> anyhow::Result<String> {
+        let recipe = params
+            .get("just")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| anyhow::anyhow!("b00t_just requires just: string"))?;
+        let args: Vec<&str> = params
+            .get("args")
+            .and_then(|value| value.as_array())
+            .into_iter()
+            .flatten()
+            .map(|value| {
+                value
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("b00t_just args must be strings"))
+            })
+            .collect::<anyhow::Result<_>>()?;
+        let output = std::process::Command::new("just")
+            .arg(recipe)
+            .args(args)
+            .output()
+            .map_err(|error| anyhow::anyhow!("just exec failed: {}", error))?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if output.status.success() {
+            Ok(format!("{stdout}{stderr}"))
+        } else {
+            anyhow::bail!("{stdout}{stderr}")
+        }
+    }
+}
+
+// BVerifyCommand: verify a Z3/SMT2 assertion by shelling directly to `z3 -in`.
+// 🤓 Was `b00t-cli admin verify --assertion ...` — that subcommand never
+//    existed (no "admin" command in b00t-cli's Commands enum at all), so this
+//    always failed and every caller (grammar-shape audit, verify tool loop)
+//    silently got back {"result":"error"} regardless of the assertion.
+//    Matches the working `z3 -in` piped-stdin pattern already used by
+//    b00t-c0re-lib::z3_examples and b00t-datum-core::edl.
 #[derive(Parser, Clone)]
 pub struct BVerifyCommand {
     #[arg(help = "Z3 or formal assertion string")]
@@ -1962,19 +2398,42 @@ impl crate::clap_reflection::McpExecutor for BVerifyCommand {
     fn execute_mcp_call(
         params: &std::collections::HashMap<String, serde_json::Value>,
     ) -> anyhow::Result<String> {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
         let assertion = params
             .get("assertion")
             .and_then(|v| v.as_str())
             .unwrap_or("true");
-        let output = std::process::Command::new("b00t-cli")
-            .args(["admin", "verify", "--assertion", assertion])
-            .output()
-            .map_err(|e| anyhow::anyhow!("verify failed: {}", e))?;
-        if output.status.success() {
-            Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        let mut child = Command::new("z3")
+            .arg("-in")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("z3 not found in PATH: {e}"))?;
+        child
+            .stdin
+            .as_mut()
+            .expect("stdin was piped")
+            .write_all(assertion.as_bytes())?;
+        let output = child.wait_with_output()?;
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_lowercase();
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let result = if stdout == "unsat" {
+            "unsat"
+        } else if stdout == "sat" {
+            "sat"
         } else {
-            anyhow::bail!("{}", String::from_utf8_lossy(&output.stderr))
-        }
+            "unknown"
+        };
+        Ok(serde_json::json!({
+            "result": result,
+            "verified": result != "unknown",
+            "raw_stdout": stdout,
+            "raw_stderr": stderr,
+        })
+        .to_string())
     }
 }
 
@@ -2052,6 +2511,7 @@ pub fn create_mcp_registry_with_notify(
         .register::<WhoamiCommand>()
         .register::<StatusCommand>()
         .register::<BExecCommand>()
+        .register::<BJustCommand>()
         .register::<BDiscoverCommand>()
         .register::<BPipelineCommand>()
         .add_post_hook("b00t_mcp_stack_load", std::sync::Arc::clone(&notify_fn))
@@ -2100,6 +2560,7 @@ pub fn create_full_mcp_registry() -> McpCommandRegistry {
         .register::<AgentProgressCommand>()
         .register::<AgentVoteCreateCommand>()
         .register::<AgentVoteSubmitCommand>()
+        .register::<AgentVoteTallyCommand>()
         .register::<DelegateDatumCommand>()
         .register::<AgentWaitCommand>()
         .register::<AgentNotifyCommand>()
@@ -2111,6 +2572,7 @@ pub fn create_full_mcp_registry() -> McpCommandRegistry {
         .register::<GrokAskCommand>()
         .register::<GrokLearnCommand>()
         .register::<GrokStatusCommand>()
+        .register::<GrokWanderCommand>()
         // Tutorial progression tools
         .register::<TutorialStatusCommand>()
         .register::<TutorialNextCommand>()
@@ -2124,6 +2586,12 @@ pub fn create_full_mcp_registry() -> McpCommandRegistry {
         .register::<TaskAddCommand>()
         .register::<TaskDoneCommand>()
         .register::<TaskUpdateCommand>()
+        // Justfile capability discovery — wraps b00t-cli justfile registry/query
+        .register::<JustfileListCommand>()
+        .register::<JustfileQueryCommand>()
+        .register::<JustfileValidateCommand>()
+        .register::<JustfileRegistryCommand>()
+        .register::<JustfileRunCommand>()
         // Pipeline lifecycle tool — GH #717/#736
         .register::<BPipelineCommand>();
     // ACP Hive coordination tools
@@ -2156,6 +2624,61 @@ lazy_static::lazy_static! {
 
 lazy_static::lazy_static! {
     static ref NATS_CLIENT: tokio::sync::Mutex<Option<b00t_chat::ChatClient>> = tokio::sync::Mutex::new(None);
+}
+
+// ┌──────────────────────────────────────────────────────────────────────────────┐
+// │ b00t-council wiring: durable/observable player messages + real vote tally     │
+// └──────────────────────────────────────────────────────────────────────────────┘
+
+/// Durable message/vote log, shared by the agent_message/notify/vote MCP
+/// tools. NATS delivery is unchanged (still fire-and-forget) — this adds the
+/// durable record NATS never provided. Path overridable via
+/// `B00T_MESSAGE_LOG_PATH` (used by tests to avoid writing into a real
+/// `~/.local/share/b00t/messages.jsonl`).
+fn message_sink() -> b00t_council::JsonlSink {
+    match std::env::var_os("B00T_MESSAGE_LOG_PATH") {
+        Some(path) => b00t_council::JsonlSink::at(path),
+        None => b00t_council::JsonlSink::default_location(),
+    }
+}
+
+/// Best-effort identity of whichever process is calling these MCP tools.
+/// None of the agent_message/notify/vote tool params carry an explicit
+/// sender id today, so this is the fallback used to attribute recorded
+/// envelopes and to look up `sender_is_player`.
+fn caller_agent_id() -> String {
+    std::env::var("B00T_AGENT_ID")
+        .or_else(|_| std::env::var("USER"))
+        .unwrap_or_else(|_| "mcp-anonymous".to_string())
+}
+
+/// Record one [`b00t_council::Envelope`] to the durable log. Failures are
+/// observability-only and never fail the caller's MCP tool invocation —
+/// mirrors `b00t-ipc::MessageBus::send`'s non-blocking sink write.
+fn record_message<T: serde::Serialize>(from: &str, to: b00t_council::Recipient, body: T) {
+    let sender_is_player = b00t_cli::commands::crew_handler::is_player(from);
+    let envelope = b00t_council::Envelope::new(from, to, sender_is_player, body);
+    match envelope.to_value_envelope() {
+        Ok(erased) => {
+            if let Err(e) = message_sink().record(&erased) {
+                eprintln!("b00t-mcp: message log record failed: {e:#}");
+            }
+        }
+        Err(e) => eprintln!("b00t-mcp: message log serialize failed: {e:#}"),
+    }
+}
+
+/// `vote_type` (from `AgentVoteCreateCommand`) -> `b00t_council::Quorum`.
+/// `"veto_capable"` matches `b00t_c0re_lib::agent_coordination::VotingType::
+/// VetoCapable`'s naming. Unrecognized/absent types fall back to
+/// `AtLeast(2)`, matching `b00t-ipc::Proposal`'s original default.
+fn quorum_for_vote_type(vote_type: &str) -> b00t_council::Quorum {
+    match vote_type {
+        "unanimous" => b00t_council::Quorum::Unanimous,
+        "majority" | "single_choice" | "ranked_choice" => b00t_council::Quorum::Majority,
+        "veto_capable" => b00t_council::Quorum::LiberumVeto,
+        _ => b00t_council::Quorum::AtLeast(2),
+    }
 }
 
 async fn get_nats_client() -> anyhow::Result<b00t_chat::ChatClient> {
@@ -2396,6 +2919,10 @@ mod tests {
             "exec must be in surface"
         );
         assert!(
+            surface_names.contains(&"b00t_just"),
+            "typed just execution must be in surface"
+        );
+        assert!(
             surface_names.contains(&"b00t_discover"),
             "discover must be in surface"
         );
@@ -2414,6 +2941,15 @@ mod tests {
         let full_names: Vec<&str> = full_tools.iter().map(|t| t.name.as_ref()).collect();
         assert!(full_names.contains(&"b00t_mcp_list"));
         assert!(full_names.contains(&"b00t_cli_detect"));
+    }
+
+    #[test]
+    fn test_just_tool_schema_uses_just_parameter() {
+        let tool = BJustCommand::to_mcp_tool();
+        let properties = tool.input_schema["properties"].as_object().unwrap();
+
+        assert!(properties.contains_key("just"));
+        assert!(!properties.contains_key("argv"));
     }
 
     #[test]
@@ -2549,6 +3085,63 @@ mod tests {
     fn test_pipeline_tool_in_catalog() {
         let has_entry = TOOL_CATALOG.iter().any(|e| e.name == "b00t_pipeline");
         assert!(has_entry, "b00t_pipeline must be in TOOL_CATALOG");
+    }
+
+    #[test]
+    fn test_justfile_tools_registered_and_discoverable() {
+        let full = create_full_mcp_registry();
+        let tools = full.get_tools();
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
+        assert!(names.contains(&"justfile_list"));
+        assert!(names.contains(&"justfile_query"));
+        assert!(names.contains(&"justfile_validate"));
+        assert!(names.contains(&"justfile_registry"));
+        assert!(names.contains(&"justfile_run"));
+
+        assert!(
+            TOOL_CATALOG.iter().any(|e| e.name == "justfile_query"),
+            "justfile_query must be discoverable through b00t_discover"
+        );
+        assert!(
+            TOOL_CATALOG.iter().any(|e| e.name == "justfile_run"),
+            "justfile_run must be discoverable through b00t_discover"
+        );
+    }
+
+    #[test]
+    fn test_bexec_shlex_tokenizes_quoted_multiword_arg() {
+        let argv = r#"task add "some multi word description""#;
+        let parts = shlex::split(argv).expect("valid shell quoting must tokenize");
+        assert_eq!(parts, vec!["task", "add", "some multi word description"]);
+    }
+
+    #[test]
+    fn test_bexec_shlex_rejects_unterminated_quote() {
+        let argv = r#"task add "unterminated"#;
+        assert!(
+            shlex::split(argv).is_none(),
+            "unterminated quote must fail tokenization, not panic"
+        );
+    }
+
+    #[test]
+    fn test_store_subcommands_discoverable() {
+        // #708: store subcommands (init/status/validate) must be discoverable
+        // via b00t_discover("store") — the CLI commands already exist and are
+        // reachable through b00t_exec, but were missing from TOOL_CATALOG.
+        let matches = discover_tools("store");
+        assert!(
+            matches.len() >= 3,
+            "expected at least 3 store entries in discover_tools(\"store\"), got {}",
+            matches.len()
+        );
+        for expected in ["b00t_store_init", "b00t_store_status", "b00t_store_validate"] {
+            assert!(
+                matches.iter().any(|e| e.name == expected),
+                "discover_tools(\"store\") missing entry {}",
+                expected
+            );
+        }
     }
 
     #[test]

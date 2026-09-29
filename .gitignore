@@ -167,7 +167,17 @@
 .eggs/
 .env
 .env.test
+.env.*
 .envrc
+# 🤓 raw secret material (nats-user/nats-password/rustfs-*-key etc.) — canonical
+# location is ~/.b00t/secrets/ (see b00t-cli/scripts/sync-*-secrets.sh), but a
+# stray duplicate has appeared at repo-root before; never let either in.
+/secrets/
+
+# vultr1 NATS leaf credential — nats.conf's `include` directive pulls this
+# in at the actual path below, not the root-level /secrets/ above; must be
+# ignored explicitly or the leaf password reaches a public host in git.
+nats/leaf-remotes.conf
 .eslintcache
 .fusebox/
 .grunt
@@ -202,6 +212,12 @@
 .spyproject
 .taskmaster/
 .taskmaster/*
+/tasks.json
+/.env.backup
+/kv-store.json
+/act-event.json
+/bootstrap-report.toon
+/memory.toml
 .tern-port
 .tox/
 .understand-anything/
@@ -300,6 +316,7 @@ togaf-cli/
 togaf-dsl/
 var/
 vendor/l3dg3rr/
+vendor/ledgrrr/
 vendor/gemm-common/
 venv.bak/
 venv/
@@ -334,5 +351,33 @@ vendor/pi-mono/
 .b00t/ledgrrr-mock.jsonl
 .b00t/toolscore/
 .b00t/verification-artifacts.jsonl
+.b00t/jobs/
+**/.b00t/jobs/
+
+# DstackProvider scratch configs — written into the invocation CWD (dstack's
+# own `apply` requires the config file to be inside CWD's subtree), best-
+# effort cleaned up after each `dstack apply`; ignored as a safety net.
+.*.dstack.yml
 /target
 vscode.🆚/vscode-docs/
+.worktrees
+
+# Stray root-level test/ dir (#935): bats-core + bats-assert/bats-support
+# clones sometimes get checked out here by accident. The registered
+# submodules live under _b00t_/test/ — this anchored pattern only matches
+# the repo-root-level dir, not _b00t_/test/ or other nested test/ dirs.
+/test/
+.dagu/
+ralph-B/*.log
+ralph-B/*.done
+ralph-loop.log
+ralph-loop.nohup
+.b00t/*.jsonl
+.b00t/*.out
+.b00t/*.log
+.b00t/*.nohup
+.b00t/ledgrrr-focus-queue.jsonl
+dl*.log
+curl-dl.log
+.b00t/gpu-heater-backlog.txt
+.cargo/config.toml

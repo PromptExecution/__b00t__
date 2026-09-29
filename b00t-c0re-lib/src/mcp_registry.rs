@@ -55,6 +55,9 @@ pub struct McpServerConfig {
     /// Server transport type
     #[serde(default = "default_transport")]
     pub transport: ServerTransport,
+    /// Server URL, for http-stream/websocket transports (stdio servers leave this None)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
 }
 
 fn default_transport() -> ServerTransport {
@@ -151,6 +154,10 @@ pub enum RegistrationSource {
     Local,
     /// Synced from official MCP registry
     OfficialRegistry,
+    /// Synced from the Vinkius Open Data Initiative (open, no-auth
+    /// github.com/vinkius-labs/mcp-database markdown dataset — distinct from
+    /// the paid discover-mcp/api.vinkius.com "unblessed" product)
+    VinkiusMcpDatabase,
     /// Auto-discovered from system
     Discovered,
     /// Imported from configuration file
@@ -195,6 +202,180 @@ fn infer_command(packages: &[RegistryPackage]) -> (String, Vec<String>) {
         }
     }
     ("echo".to_string(), vec!["no executable package found".to_string()])
+}
+
+/// Result of parsing one `mcps/*.md` file from the vinkius-mcp-database dataset.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedVinkiusEntry {
+    name: String,
+    description: String,
+    category: Option<String>,
+    tools: Vec<String>,
+    requires_token: bool,
+}
+
+/// Turn a kebab/snake-case filename slug into a human-ish title, used as a
+/// fallback `name` when a file has no (or a malformed) H1 heading.
+fn slug_to_title(slug: &str) -> String {
+    slug.split(['-', '_'])
+        .filter(|w| !w.is_empty())
+        .map(|word| {
+            let mut chars = word.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Parse one vinkius-mcp-database markdown file body into its useful parts.
+///
+/// The dataset (6533 files as of this writing) is machine-generated from a
+/// consistent template — H1 title, `## Overview` (with a `**Category:**
+/// [slug](../categories/slug.md)` line + one-paragraph blurb), `## Description`
+/// (longer blurb + `### ...` subsections we intentionally don't capture),
+/// `## Available Tools (N)` (`- **tool_name**: tool description` bullets) —
+/// but as an open community dataset it's not guaranteed uniform, so every
+/// step here degrades gracefully (missing sections, missing bold-markers on
+/// tool bullets, multi-line tool descriptions that spill onto an unmarked
+/// continuation line, etc.) rather than erroring or panicking.
+fn parse_vinkius_markdown(slug: &str, content: &str) -> ParsedVinkiusEntry {
+    #[derive(PartialEq)]
+    enum Section {
+        None,
+        Overview,
+        Description,
+        Tools,
+        Other,
+    }
+
+    let mut name: Option<String> = None;
+    let mut category: Option<String> = None;
+    let mut tools: Vec<String> = Vec::new();
+    let mut overview_lines: Vec<String> = Vec::new();
+    let mut description_lines: Vec<String> = Vec::new();
+    let mut overview_done = false;
+    let mut description_done = false;
+    let mut section = Section::None;
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+
+        // H1 title — take the first one encountered, wherever it appears
+        // (some files lead with badge images before the heading).
+        if name.is_none() {
+            if let Some(rest) = trimmed.strip_prefix("# ") {
+                let candidate = rest.trim();
+                if !candidate.is_empty() {
+                    name = Some(candidate.to_string());
+                    continue;
+                }
+            }
+        }
+
+        if let Some(rest) = trimmed.strip_prefix("## ") {
+            let heading = rest.trim().to_lowercase();
+            section = if heading.starts_with("overview") {
+                Section::Overview
+            } else if heading.starts_with("description") {
+                Section::Description
+            } else if heading.starts_with("available tools") {
+                Section::Tools
+            } else {
+                Section::Other
+            };
+            continue;
+        }
+
+        match section {
+            Section::Overview => {
+                if overview_done {
+                    continue;
+                }
+                if let Some(cat) = trimmed.strip_prefix("**Category:**") {
+                    if let Some(start) = cat.find('[') {
+                        if let Some(end) = cat[start + 1..].find(']') {
+                            let cat_slug = cat[start + 1..start + 1 + end].trim();
+                            if !cat_slug.is_empty() {
+                                category = Some(cat_slug.to_string());
+                            }
+                        }
+                    }
+                    continue;
+                }
+                // A subheading (### ...) ends the short blurb we care about.
+                if trimmed.starts_with('#') {
+                    overview_done = true;
+                    continue;
+                }
+                if !trimmed.is_empty() {
+                    overview_lines.push(trimmed.to_string());
+                }
+            }
+            Section::Description => {
+                if description_done {
+                    continue;
+                }
+                // Stop at the first subsection (### What you can do / ### How
+                // it works / ...) — we only want the lead paragraph, not the
+                // full enumerated feature list, for a compact description.
+                if trimmed.starts_with('#') {
+                    description_done = true;
+                    continue;
+                }
+                if !trimmed.is_empty() {
+                    description_lines.push(trimmed.to_string());
+                }
+            }
+            Section::Tools => {
+                let Some(rest) = trimmed.strip_prefix("- ") else {
+                    continue;
+                };
+                let Some(bold_start) = rest.find("**") else {
+                    continue;
+                };
+                let after = &rest[bold_start + 2..];
+                let Some(bold_end) = after.find("**") else {
+                    continue;
+                };
+                let tool_name = after[..bold_end].trim();
+                if !tool_name.is_empty() {
+                    tools.push(tool_name.to_string());
+                }
+            }
+            Section::None | Section::Other => {}
+        }
+    }
+
+    let name = name.unwrap_or_else(|| slug_to_title(slug));
+
+    let description = if !description_lines.is_empty() {
+        description_lines.join(" ")
+    } else if !overview_lines.is_empty() {
+        overview_lines.join(" ")
+    } else {
+        format!("MCP server: {}", name)
+    };
+
+    // Heuristic: flag entries that document a hosted service requiring a
+    // per-provider credential, so registry consumers can filter them out of
+    // "zero-auth invokable" searches. Broader than the literal "Access Token"
+    // phrase per the task brief's "or similar" — community write-ups phrase
+    // this many different ways (Client ID/Secret, API key, Authorization Key).
+    let lower = content.to_lowercase();
+    let requires_token = ["access token", "api key", "api keys", "client id", "client secret", "authorization key", "auth token", "bearer token"]
+        .iter()
+        .any(|needle| lower.contains(needle));
+
+    ParsedVinkiusEntry {
+        name,
+        description,
+        category,
+        tools,
+        requires_token,
+    }
 }
 
 #[cfg(test)]
@@ -247,6 +428,249 @@ mod registry_tests {
         assert_eq!(cmd, "npx");
         assert_eq!(args, vec!["-y", "valid-pkg"]);
     }
+
+    const DVC_MD: &str = r#"# DVC MCP Server
+
+[![Deploy on Vinkius Edge](https://img.shields.io/badge/Deploy%20on-Vinkius%20Edge-blue?style=for-the-badge)](https://vinkius.com/ai-agent-connect/dvc)
+
+## Overview
+
+**Category:** [developer-tools](../categories/developer-tools.md)
+
+Manage ML experiments via DVC — track projects and views, audit experiments history, and monitor model runs directly from any AI agent.
+
+## Description
+Connect your **DVC Studio** account to any AI agent and take full control of your machine learning experiments and data versioning workflows through natural conversation.
+
+### What you can do
+
+- **Project Orchestration** — Expose registered organization workspaces
+
+### How it works
+
+1. Subscribe to this server
+2. Enter your DVC Studio Client Access Token (found in DVC Studio Profile Settings > Tokens)
+
+## Available Tools (6)
+- **get_project**: Get project
+- **list_experiments**: List experiments
+- **list_views**: List views
+- **get_view**: Get view
+- **list_projects**: List projects
+- **get_user**: Get user profile
+
+
+## 💬 Prompt Examples
+Some examples here.
+"#;
+
+    #[test]
+    fn test_parse_vinkius_markdown_dvc_shape() {
+        let parsed = parse_vinkius_markdown("dvc", DVC_MD);
+        assert_eq!(parsed.name, "DVC MCP Server");
+        assert_eq!(parsed.category.as_deref(), Some("developer-tools"));
+        assert!(parsed.description.contains("Connect your"));
+        // Description must not bleed into the "### What you can do" bullets
+        assert!(!parsed.description.contains("Project Orchestration"));
+        assert_eq!(
+            parsed.tools,
+            vec![
+                "get_project",
+                "list_experiments",
+                "list_views",
+                "get_view",
+                "list_projects",
+                "get_user",
+            ]
+        );
+        assert!(parsed.requires_token, "mentions 'Client Access Token'");
+    }
+
+    // Real edge case seen in the wild (conflux.md): a tool's description
+    // spills onto a blank-line-separated continuation that is NOT prefixed
+    // with "- **" — must not be mistaken for another tool bullet.
+    #[test]
+    fn test_parse_vinkius_markdown_multiline_tool_description() {
+        let md = r#"# Conflux MCP Server
+
+## Overview
+
+**Category:** [developer-tools](../categories/developer-tools.md)
+
+Query Conflux Network data.
+
+## Description
+Connect to the Conflux Network.
+
+## Available Tools (2)
+- **cfx_send_transaction**: Requires the node to manage the sender account.
+
+Send an unsigned transaction to the Core Space network
+- **cfx_get_status**: Get current state of the node
+"#;
+        let parsed = parse_vinkius_markdown("conflux", md);
+        assert_eq!(
+            parsed.tools,
+            vec!["cfx_send_transaction", "cfx_get_status"]
+        );
+        assert!(!parsed.requires_token, "RPC URL config, not a token");
+    }
+
+    // Defensive parsing: a maximally malformed file (no H1, no known
+    // sections, no tool bullets) must still yield a usable fallback
+    // registration rather than panicking or erroring.
+    #[test]
+    fn test_parse_vinkius_markdown_malformed_file_falls_back() {
+        let md = "just some\nunstructured text\nwith no headings at all";
+        let parsed = parse_vinkius_markdown("some-weird-slug", md);
+        assert_eq!(parsed.name, "Some Weird Slug");
+        assert!(parsed.category.is_none());
+        assert!(parsed.tools.is_empty());
+        assert!(!parsed.description.is_empty());
+        assert!(!parsed.requires_token);
+    }
+
+    #[test]
+    fn test_parse_vinkius_markdown_no_bold_tool_bullets_skipped_gracefully() {
+        let md = r#"# Some Server
+
+## Available Tools (2)
+- get_thing: no bold markers on this one
+- **real_tool**: this one has bold markers
+"#;
+        let parsed = parse_vinkius_markdown("some-server", md);
+        assert_eq!(parsed.tools, vec!["real_tool"]);
+    }
+
+    #[test]
+    fn test_slug_to_title() {
+        assert_eq!(slug_to_title("country-data-resolver"), "Country Data Resolver");
+        assert_eq!(slug_to_title("dvc"), "Dvc");
+        assert_eq!(slug_to_title(""), "");
+    }
+
+    /// Regression test for #1112: sync results must survive a *fresh*
+    /// `McpRegistry` construction, not just be visible within the same
+    /// in-process instance that ran the sync. Simulates what
+    /// `sync_official_registry`/`sync_vinkius_mcp_database` do (insert an
+    /// entry, then persist) without needing network access, then constructs
+    /// a brand-new registry against the same `storage_path` — mirroring two
+    /// separate CLI invocations (`sync-vinkius-database` then `search`).
+    #[test]
+    fn test_synced_entries_persist_and_reload_across_construction() {
+        let storage_path = std::env::temp_dir()
+            .join(format!("b00t-test-mcp-registry-persist-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&storage_path);
+
+        let mut registry = McpRegistry {
+            servers: HashMap::new(),
+            storage_path: storage_path.clone(),
+            enable_official_sync: true,
+        };
+        registry.servers.insert(
+            "test.persist/1112-fixture".to_string(),
+            McpServerRegistration {
+                id: "test.persist/1112-fixture".to_string(),
+                name: "Persist Regression Fixture".to_string(),
+                description: "regression fixture for issue #1112".to_string(),
+                version: "0.0.0".to_string(),
+                homepage: None,
+                documentation: None,
+                license: None,
+                tags: vec!["test-1112".to_string()],
+                config: McpServerConfig {
+                    command: "echo".to_string(),
+                    args: vec![],
+                    env: None,
+                    cwd: None,
+                    transport: ServerTransport::Stdio,
+                    url: None,
+                },
+                metadata: RegistrationMetadata {
+                    registered_at: Utc::now(),
+                    updated_at: Utc::now(),
+                    source: RegistrationSource::VinkiusMcpDatabase,
+                    health_status: HealthStatus::Unknown,
+                    last_health_check: None,
+                    dependencies: Vec::new(),
+                    installation_status: InstallationStatus::NotInstalled,
+                },
+            },
+        );
+        registry.save().expect("save should succeed");
+
+        // Before the #1112 fix, McpRegistry::new(..., false) never read
+        // storage_path at all — this entry would be invisible here, matching
+        // the reported "search returns 0 results after a separate sync
+        // invocation" symptom.
+        let reloaded =
+            McpRegistry::new(storage_path.clone(), false).expect("fresh construction should succeed");
+        let hits = reloaded.search("Persist Regression Fixture");
+        assert!(
+            hits.iter().any(|s| s.id == "test.persist/1112-fixture"),
+            "synced entry must survive across a fresh McpRegistry construction"
+        );
+
+        let _ = std::fs::remove_file(&storage_path);
+    }
+
+    // Real end-to-end check: shallow-clone the actual vinkius-mcp-database
+    // repo, sync it into a registry, and confirm the dvc.md entry (used as
+    // the worked example in the task spec) round-trips through search().
+    // Network + `git` binary required, so this is #[ignore]d by default;
+    // run explicitly with `cargo test --ignored -- --nocapture`.
+    #[tokio::test]
+    #[ignore = "network: shallow-clones https://github.com/vinkius-labs/mcp-database"]
+    async fn test_vinkius_mcp_database_sync_and_search_dvc() {
+        let mut registry = McpRegistry {
+            servers: HashMap::new(),
+            storage_path: std::env::temp_dir().join("b00t-test-vinkius-registry.json"),
+            enable_official_sync: true,
+        };
+
+        let synced = registry
+            .sync_vinkius_mcp_database()
+            .await
+            .expect("vinkius-mcp-database sync should succeed");
+        println!("synced {} servers from vinkius-mcp-database", synced);
+        assert!(
+            synced > 1000,
+            "expected at least 1000 servers synced (repo has 6533 mcps/*.md files), got {}",
+            synced
+        );
+
+        let dvc_hits = registry.search("dvc");
+        assert!(!dvc_hits.is_empty(), "expected a 'dvc' search hit");
+        let dvc = dvc_hits
+            .iter()
+            .find(|s| s.id.ends_with("/dvc"))
+            .expect("expected the dvc.md-derived entry specifically");
+        println!("dvc entry: {:#?}", dvc);
+        assert_eq!(dvc.name, "DVC MCP Server");
+        assert!(dvc.tags.contains(&"vinkius-mcp-database".to_string()));
+        assert!(
+            dvc.tags.contains(&"requires-token".to_string()),
+            "dvc.md documents a 'Client Access Token' — must be tagged requires-token"
+        );
+        assert!(dvc.description.contains("list_experiments"));
+
+        // Spot-check a few other entries parsed correctly (not empty/garbage).
+        let others: Vec<_> = registry
+            .list()
+            .into_iter()
+            .filter(|s| {
+                s.tags.contains(&"vinkius-mcp-database".to_string()) && !s.id.ends_with("/dvc")
+            })
+            .take(3)
+            .collect();
+        assert_eq!(others.len(), 3);
+        for s in &others {
+            println!("spot-check: {} — {}", s.id, s.name);
+            assert!(!s.name.trim().is_empty());
+            assert!(!s.description.trim().is_empty());
+            assert!(s.tags.contains(&"vinkius-mcp-database".to_string()));
+        }
+    }
 }
 
 impl McpRegistry {
@@ -263,8 +687,23 @@ impl McpRegistry {
         if from_file {
             registry.load()?;
         } else {
-            // Load from datum files instead of file
-            if let Err(e) = registry.sync_from_datums("~/.b00t") {
+            // #1112: seed with whatever a prior `sync-official`/
+            // `sync-vinkius-database` invocation persisted (best-effort —
+            // missing/corrupt cache is not fatal, just starts empty) before
+            // layering datum files on top. Datum-backed servers still win on
+            // id collision (sync_from_datums inserts after this), keeping
+            // datum TOMLs authoritative for anything they define; this only
+            // fills in the entries that have no datum at all — the synced
+            // ones search couldn't find across invocations before.
+            if let Err(e) = registry.load() {
+                debug!("No prior synced registry cache to load: {}", e);
+            }
+
+            // Load from datum files instead of file. Datum TOMLs live one
+            // level under the dotfiles root (~/.b00t/_b00t_/*.mcp.toml, per
+            // the `sync-datums --path ~/.dotfiles/_b00t_` example in this
+            // command's own --help) -- not directly in ~/.b00t/.
+            if let Err(e) = registry.sync_from_datums("~/.b00t/_b00t_") {
                 warn!("Failed to sync from datums: {}", e);
             }
         }
@@ -288,12 +727,25 @@ impl McpRegistry {
         Ok(())
     }
 
-    /// Save registry to storage - NO-OP in the new design since registry is runtime-only
-    #[allow(dead_code)]
+    /// Persists `self.servers` as JSON to `storage_path`. #1112: this used to
+    /// be a no-op ("registry is runtime-only") — that's still the right
+    /// default for datum-backed and locally-registered entries (the datum
+    /// TOML files remain their source of truth, re-derived fresh by
+    /// `sync_from_datums` on every construction), but it left sync-derived
+    /// entries (`sync_official_registry`, `sync_vinkius_mcp_database`) with
+    /// nowhere durable to live: those servers have no corresponding on-disk
+    /// datum, so `search` in a later CLI invocation always saw zero results
+    /// from a prior `sync-*` invocation. Only the two sync methods call this
+    /// now — register/unregister/health-status/etc. remain deliberately
+    /// ephemeral, unchanged from before.
     fn save(&self) -> Result<()> {
-        // In the new design, we don't persist the registry to file
-        // The source of truth is the datum TOML files in ~/.b00t/
-        debug!("Registry persistence disabled - using datum files as source of truth");
+        if let Some(parent) = self.storage_path.parent() {
+            std::fs::create_dir_all(parent).context("Failed to create registry storage dir")?;
+        }
+        let data =
+            serde_json::to_string_pretty(&self.servers).context("Failed to serialize registry")?;
+        std::fs::write(&self.storage_path, data).context("Failed to write registry storage")?;
+        debug!("💾 Saved {} servers to {}", self.servers.len(), self.storage_path.display());
         Ok(())
     }
 
@@ -450,7 +902,12 @@ impl McpRegistry {
         }
 
         if synced_count > 0 {
-            // Don't save to file - registry is runtime-only, sync is ephemeral
+            // #1112: persist so a later `search` invocation sees what this
+            // sync fetched — non-fatal on write failure (still usable this
+            // run; just won't survive to the next invocation).
+            if let Err(e) = self.save() {
+                warn!("Failed to persist synced registry: {}", e);
+            }
         }
 
         info!("✅ Synced {} servers from official registry", synced_count);
@@ -531,6 +988,7 @@ impl McpRegistry {
                 env: None,
                 cwd: None,
                 transport: ServerTransport::Stdio,
+                url: None,
             };
 
             servers.push(McpServerRegistration {
@@ -556,6 +1014,241 @@ impl McpRegistry {
         }
 
         info!("Fetched {} servers from official registry", servers.len());
+        Ok(servers)
+    }
+
+    /// Sync with the Vinkius Open Data Initiative (open, no-auth
+    /// github.com/vinkius-labs/mcp-database markdown dataset).
+    ///
+    /// NOTE: this is distinct from Vinkius's other, *paid* product — the
+    /// `discover-mcp` npm package / api.vinkius.com live catalog, which
+    /// 401s without a paid VINKIUS_CATALOG_TOKEN and is explicitly
+    /// "unblessed" / out of scope here. Only the public mcp-database repo
+    /// is indexed.
+    pub async fn sync_vinkius_mcp_database(&mut self) -> Result<usize> {
+        info!("🔄 Syncing with Vinkius Open Data Initiative (mcp-database)");
+
+        let vinkius_servers = self.fetch_vinkius_mcp_database().await?;
+        let mut synced_count = 0;
+
+        for server in vinkius_servers {
+            // Only add if not already registered locally
+            if !self.servers.contains_key(&server.id) {
+                info!("📥 Adding server from vinkius-mcp-database: {}", server.id);
+                self.servers.insert(server.id.clone(), server);
+                synced_count += 1;
+            }
+        }
+
+        if synced_count > 0 {
+            // #1112: persist so a later `search` invocation sees what this
+            // sync fetched — non-fatal on write failure (still usable this
+            // run; just won't survive to the next invocation).
+            if let Err(e) = self.save() {
+                warn!("Failed to persist synced registry: {}", e);
+            }
+        }
+
+        info!(
+            "✅ Synced {} servers from vinkius-mcp-database",
+            synced_count
+        );
+        Ok(synced_count)
+    }
+
+    /// Fetch servers from the Vinkius Open Data Initiative
+    /// (github.com/vinkius-labs/mcp-database).
+    ///
+    /// The dataset has thousands of one-file-per-server markdown docs under
+    /// `mcps/*.md` (6533 as of writing) — fetching each individually via the
+    /// GitHub contents/raw API would mean thousands of HTTP requests, so
+    /// instead this does a single shallow (`--depth 1`) git clone to a temp
+    /// dir, reads the files directly off disk, and removes the temp dir
+    /// (via `TempDir`'s `Drop` impl) when done.
+    async fn fetch_vinkius_mcp_database(&self) -> Result<Vec<McpServerRegistration>> {
+        let repo_url = std::env::var("VINKIUS_MCP_DATABASE_URL")
+            .unwrap_or_else(|_| "https://github.com/vinkius-labs/mcp-database".to_string());
+
+        info!(
+            "Shallow-cloning vinkius-mcp-database from {} for indexing",
+            repo_url
+        );
+
+        let temp_dir = tempfile::Builder::new()
+            .prefix("b00t-vinkius-mcp-database-")
+            .tempdir()
+            .context("Failed to create temp dir for vinkius-mcp-database clone")?;
+
+        let clone_path = temp_dir.path();
+        let clone_path_str = clone_path
+            .to_str()
+            .context("temp clone dir path is not valid UTF-8")?;
+
+        let output = tokio::process::Command::new("git")
+            .args([
+                "clone",
+                "--depth",
+                "1",
+                "--single-branch",
+                "--quiet",
+                &repo_url,
+                clone_path_str,
+            ])
+            .output()
+            .await
+            .context("Failed to run `git clone` for vinkius-mcp-database")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            warn!(
+                "git clone of vinkius-mcp-database failed: {}",
+                stderr.chars().take(500).collect::<String>()
+            );
+            return Ok(Vec::new());
+        }
+
+        let mcps_dir = clone_path.join("mcps");
+        if !mcps_dir.is_dir() {
+            warn!(
+                "vinkius-mcp-database clone has no mcps/ directory at {}",
+                mcps_dir.display()
+            );
+            return Ok(Vec::new());
+        }
+
+        let mut servers = Vec::new();
+        let mut scanned = 0usize;
+        let mut skipped = 0usize;
+
+        let entries = std::fs::read_dir(&mcps_dir)
+            .context("Failed to read mcps/ directory from vinkius-mcp-database clone")?;
+
+        for entry in entries {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) => {
+                    warn!("Skipping unreadable dir entry in mcps/: {}", e);
+                    skipped += 1;
+                    continue;
+                }
+            };
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("md") {
+                continue;
+            }
+
+            let Some(slug) = path.file_stem().and_then(|s| s.to_str()) else {
+                skipped += 1;
+                continue;
+            };
+            let slug = slug.to_string();
+            scanned += 1;
+
+            let content = match std::fs::read_to_string(&path) {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!("Failed to read {}: {}", path.display(), e);
+                    skipped += 1;
+                    continue;
+                }
+            };
+            if content.trim().is_empty() {
+                skipped += 1;
+                continue;
+            }
+
+            let parsed = parse_vinkius_markdown(&slug, &content);
+
+            let id = format!("io.github.vinkius-labs.mcp-database/{}", slug);
+            let homepage = format!(
+                "https://github.com/vinkius-labs/mcp-database/blob/main/mcps/{}.md",
+                slug
+            );
+
+            let mut tags = vec!["vinkius-mcp-database".to_string()];
+            if let Some(cat) = &parsed.category {
+                tags.push(format!("category:{}", cat));
+            }
+            if parsed.requires_token {
+                tags.push("requires-token".to_string());
+            }
+
+            // No established precedent in this registry for a purely
+            // metadata/discoverability entry with no locally-runnable
+            // command (unlike official-registry/datum entries, these are
+            // hosted-remote MCP servers documented for search, not proven
+            // runnable via a local command). Mirror `infer_command`'s
+            // existing "no executable package found" convention for the
+            // no-package case, and additionally document the required
+            // credential as an env var placeholder for token-gated entries.
+            let (command, args, env) = if parsed.requires_token {
+                (
+                    "echo".to_string(),
+                    vec![format!(
+                        "{}: remote hosted MCP server (vinkius-mcp-database) — requires a provider access token, see documentation",
+                        parsed.name
+                    )],
+                    Some(HashMap::from([(
+                        "MCP_ACCESS_TOKEN".to_string(),
+                        "<REQUIRED: obtain from provider — see documentation link>".to_string(),
+                    )])),
+                )
+            } else {
+                (
+                    "echo".to_string(),
+                    vec![format!(
+                        "{}: metadata-only entry from vinkius-mcp-database — no runnable local command, see documentation",
+                        parsed.name
+                    )],
+                    None,
+                )
+            };
+
+            let description = if parsed.tools.is_empty() {
+                parsed.description
+            } else {
+                format!("{} Tools: {}.", parsed.description, parsed.tools.join(", "))
+            };
+
+            servers.push(McpServerRegistration {
+                id,
+                name: parsed.name,
+                description,
+                version: "unknown".to_string(),
+                homepage: Some(homepage.clone()),
+                documentation: Some(homepage),
+                license: None,
+                tags,
+                config: McpServerConfig {
+                    command,
+                    args,
+                    env,
+                    cwd: None,
+                    transport: ServerTransport::Stdio,
+                    url: None,
+                },
+                metadata: RegistrationMetadata {
+                    registered_at: Utc::now(),
+                    updated_at: Utc::now(),
+                    source: RegistrationSource::VinkiusMcpDatabase,
+                    health_status: HealthStatus::Unknown,
+                    last_health_check: None,
+                    dependencies: Vec::new(),
+                    installation_status: InstallationStatus::NotInstalled,
+                },
+            });
+        }
+
+        info!(
+            "Parsed {} servers from vinkius-mcp-database ({} md files scanned, {} skipped)",
+            servers.len(),
+            scanned,
+            skipped
+        );
+
+        // temp_dir (and the clone within it) is removed here as it drops.
+        drop(temp_dir);
+
         Ok(servers)
     }
 
@@ -669,41 +1362,54 @@ impl McpRegistry {
 
         let datum = config.b00t;
 
-        // Extract command and args (prioritize mcp.stdio[0] if available)
-        let (command, args) = if let Some(mcp_val) = &datum.mcp {
-            if let Some(stdio) = mcp_val.get("stdio").and_then(|v| v.as_array()) {
-                if let Some(method) = stdio.first() {
-                    let cmd = method
-                        .get("command")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("npx")
-                        .to_string();
-                    let method_args = method
-                        .get("args")
-                        .and_then(|v| v.as_array())
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    (cmd, method_args)
-                } else {
-                    (
-                        datum.command.unwrap_or_else(|| "npx".to_string()),
-                        datum.args.unwrap_or_default(),
-                    )
-                }
-            } else {
-                (
-                    datum.command.unwrap_or_else(|| "npx".to_string()),
-                    datum.args.unwrap_or_default(),
-                )
-            }
+        // Extract command/args/transport/url. Prioritize mcp.stdio[0]; fall
+        // back to mcp.httpstream[0] (streamable-HTTP / SSE-style servers,
+        // e.g. flexo-mms-*-mcp) before falling back to a bare stdio guess.
+        // Without the httpstream branch, any non-stdio datum silently
+        // registered as command="npx" with no url -- a real bug found
+        // 2026-08-22 while assimilating Open-MBEE's Flexo MCP servers.
+        let stdio_entry = datum
+            .mcp
+            .as_ref()
+            .and_then(|mcp_val| mcp_val.get("stdio"))
+            .and_then(|v| v.as_array())
+            .and_then(|arr| arr.first());
+
+        let httpstream_entry = datum
+            .mcp
+            .as_ref()
+            .and_then(|mcp_val| mcp_val.get("httpstream"))
+            .and_then(|v| v.as_array())
+            .and_then(|arr| arr.first());
+
+        let (command, args, transport, url) = if let Some(method) = stdio_entry {
+            let cmd = method
+                .get("command")
+                .and_then(|v| v.as_str())
+                .unwrap_or("npx")
+                .to_string();
+            let method_args = method
+                .get("args")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            (cmd, method_args, ServerTransport::Stdio, None)
+        } else if let Some(method) = httpstream_entry {
+            let url = method
+                .get("url")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            (String::new(), Vec::new(), ServerTransport::HttpStream, url)
         } else {
             (
                 datum.command.unwrap_or_else(|| "npx".to_string()),
                 datum.args.unwrap_or_default(),
+                ServerTransport::Stdio,
+                None,
             )
         };
 
@@ -732,7 +1438,8 @@ impl McpRegistry {
                 args,
                 env: datum.env,
                 cwd: None,
-                transport: ServerTransport::Stdio,
+                transport,
+                url,
             },
             metadata: RegistrationMetadata {
                 registered_at: self
@@ -1058,6 +1765,7 @@ pub fn create_registration_from_datum(
             env: None,
             cwd: None,
             transport: ServerTransport::Stdio,
+            url: None,
         },
         metadata: RegistrationMetadata {
             registered_at: Utc::now(),

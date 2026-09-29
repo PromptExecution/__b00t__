@@ -1,0 +1,81 @@
+# CI RUN stage on the KUBERNETES backend (k0s on vultr1) — plan
+# gleaming-jingling-nygaard. Same job as ci-test.task.yaml (run one nextest
+# partition from the archive, no compilation) as a k8s Pod instead of a GCP
+# Spot VM: no Docker on the node (k0s containerd 2.x), lazy image pull via SOCI.
+#
+# PREREQ: the unconstrained kubernetes fleet must be up once:
+#   dstack apply -f dev-env/k0s-ci-fleet.yaml -y
+# The dstack 0.21.5 k8s backend is VERIFIED end-to-end (2026-09-09): a plain
+# task on `backends: [kubernetes]` schedules a real Pod on vultr1 and exits 0.
+# See docs/runbooks/dstack-k0s-soci.md § "dstack 0.21.5 k8s backend — VERIFIED".
+#
+# ⚠️ NODE-SIZE CEILING: vultr1 is 2 vCPU / ~3.7GB allocatable / ~67GB ephemeral.
+# A full `cpu: 4 / memory: 16GB` nextest partition will NEVER get an offer here
+# — keep the real test fan-out on GCP Spot (ci-test.task.yaml), or grow the k0s
+# node. This file runs a REDUCED partition sized to fit vultr1, for smoke /
+# identity-path coverage.
+#
+# GCS auth is KEYLESS and VERIFIED (2026-09-09): the Pod's SA (b00t-ci in ns
+# b00t-ci) is a SPIRE workload (spiffe://promptexecution.com/ns/b00t-ci/sa/
+# b00t-ci); spiffe-helper writes a JWT-SVID; gcs-obj.sh's external_account path
+# exchanges it at STS and impersonates b00t-buildplane-ci
+# (roles/storage.objectViewer on the buildcache). SPIRE + the WIF binding live
+# in PromptExecution/infrastructure (terraform/google/google-oidc-spire*.tf,
+# k0s/spire/{agent,csi-driver}.yaml). See
+# docs/superpowers/specs/2026-09-09-build-plane-identity.md.
+#
+# ⚠️ dstack 0.21.5's `kubernetes` backend does NOT surface pod-spec injection
+# (confirmed vs source: compute.py `_create_job_pod` — only `resources`,
+# `privileged`, and PVC/hostPath `volumes:` mounts; no init container, no
+# inline csi.spiffe.io volume, no configMap volume, no serviceAccountName).
+# So this Pod — csi.spiffe.io volume + spiffe-helper init + ADC ConfigMap +
+# the b00t-ci ServiceAccount — MUST run via the kubectl / Dagster path
+# (orchestration/dagster/), applying the full Pod manifest directly. Only
+# identity-free compile-free tasks go through `dstack apply` (verified).
+type: task
+name: b00t-ci-test-k0s
+
+image: australia-southeast1-docker.pkg.dev/promptexecution/b00t/b00t-build:latest
+
+backends: [kubernetes]
+
+# Sized to fit vultr1 (2 vCPU / ~3.7GB / ~67GB eph). disk is a range so it
+# combines with the unconstrained fleet.
+resources:
+  cpu: 2
+  memory: 3GB
+  disk: 30GB..60GB
+  gpu: 0
+
+env:
+  - BUILDCACHE_BUCKET=b00t-buildcache-promptexecution
+  # written by the spiffe-helper init container (see the Pod overlay); points
+  # gcs-obj.sh at the JWT-SVID for the STS exchange.
+  - GOOGLE_APPLICATION_CREDENTIALS=/cfg/credential-configuration.json
+  - GCP_WIF_AUDIENCE=//iam.googleapis.com/projects/308167228204/locations/global/workloadIdentityPools/spire-pool/providers/spire-provider
+  # supplied per-run by the workflow / Dagster:
+  - CI_ARCHIVE_KEY
+  - CI_REF
+  - NEXTEST_PARTITION            # e.g. "1/4"
+
+commands:
+  - set -eu
+  - . "$HOME/.cargo/env"
+  - test -s /cfg/credential-configuration.json   # spiffe-helper init must have run
+  - mkdir -p /data/src
+  - gcs-obj.sh get "$BUILDCACHE_BUCKET" "$CI_ARCHIVE_KEY/src.tar.zst" /data/src.tar.zst
+  - gcs-obj.sh get "$BUILDCACHE_BUCKET" "$CI_ARCHIVE_KEY/nextest.tar.zst" /data/nextest.tar.zst
+  - tar -I zstd -xf /data/src.tar.zst -C /data/src
+  - du -sh /data/src /data/nextest.tar.zst
+  - cargo nextest run
+      --archive-file /data/nextest.tar.zst
+      --workspace-remap /data/src
+      --partition "count:${NEXTEST_PARTITION}"
+
+# --- Pod overlay for the kubernetes backend (SVID delivery) ---------------
+# The verified shape (keyless-e2e 2026-09-09): a `csi.spiffe.io` ephemeral
+# volume + a spiffe-helper init container writing /svid/jwt_svid.token, and an
+# ADC ConfigMap at /cfg. dstack 0.21.5 cannot apply this (no pod-spec
+# injection — see the ⚠️ above); the Dagster / kubectl path applies the full
+# Pod. Reference manifest:
+#   k0s/spire/agent.yaml  (in PromptExecution/infrastructure)

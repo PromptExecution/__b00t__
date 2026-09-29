@@ -5,12 +5,17 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/lib/worktree-env.sh
+source "${SCRIPT_DIR}/../lib/worktree-env.sh"
+
 ISSUE_NUM="${1:?issue_num required}"
 CLUSTER="${2:?cluster required}"
 ISSUE_TITLE="${3:?issue_title required}"
 REPO="${REPO:-elasticdotventures/_b00t_}"
 MAX_OODA="${MAX_OODA:-5}"
-WORKTREE_ROOT="${WORKTREE_ROOT:-/tmp/b00t-wt}"
+WORKTREE_ROOT="${WORKTREE_ROOT:-$(b00t_default_hive_worktree_root)}"
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$(b00t_shared_cargo_target_dir)}"
 
 SLUG=$(echo "${ISSUE_TITLE}" | tr '[:upper:]' '[:lower:]' \
     | sed 's/[^a-z0-9]/-/g' | sed 's/--*/-/g' | cut -c1-40 | sed 's/-$//')
@@ -20,6 +25,8 @@ REPO_ROOT="${REPO_ROOT:-$(git rev-parse --show-toplevel)}"
 LOG="${WORKTREE_ROOT}/ooda-${ISSUE_NUM}.log"
 
 mkdir -p "${WORKTREE_ROOT}"
+mkdir -p "${CARGO_TARGET_DIR}"
+: > "${LOG}"
 
 log() { echo "[ooda #${ISSUE_NUM}] $*" | tee -a "${LOG}" >&2; }
 
@@ -58,6 +65,8 @@ decide_act() {
         fi
     fi
 
+    b00t_init_required_submodules "${WORKTREE}"
+
     # Write OODA-enriched prompt
     cat > "${WORKTREE}/.ooda-prompt.md" <<PROMPT
 # OODA Loop iter ${iter}/${MAX_OODA} — Issue #${ISSUE_NUM}
@@ -80,7 +89,7 @@ Implement the proposed changes. You are on branch ${BRANCH} in ${WORKTREE}.
 
 Rules:
 - DRY, KISS, use existing OSS libs
-- Do NOT touch submodules (integrations/, plantuml-server)
+- Do NOT touch submodules (integrations/, vendor/b00tyverse)
 - Run tests after implementing: \`cargo test\` or \`just test\` as appropriate
 - If already implemented or needs fundamental human design: output SKIP: <reason>
 - Commit with: git add -A && git commit -m "feat(#${ISSUE_NUM}): <description>"
@@ -171,6 +180,7 @@ for iter in $(seq 1 "${MAX_OODA}"); do
         log "✅ PR: ${PR_URL}"
         gh issue comment "${ISSUE_NUM}" --repo "${REPO}" \
             --body "## 🚀 PR Opened (OODA iter ${iter})\n\n${PR_URL}" 2>/dev/null || true
+        git -C "${REPO_ROOT}" worktree remove --force "${WORKTREE}" 2>/dev/null || true
         echo "${PR_URL}"
         exit 0
     fi

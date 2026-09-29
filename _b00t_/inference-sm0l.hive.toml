@@ -49,7 +49,11 @@ description = "Check sm0l pod status"
 command = "kubectl get pods,svc -n b00t-inference"
 
 [[b00t.usage]]
-description = "Set B00T_SM0L_ENDPOINT (NodePort 30801)"
+description = "Set B00T_AI_SM0L_BASE for host-side callers (adversarial review, sm0l_dispatch, validate) -- NodePort 30801, OpenAI-compatible /v1, not the in-cluster ClusterIP port"
+command = "export B00T_AI_SM0L_BASE=http://192.168.1.137:30801/v1"
+
+[[b00t.usage]]
+description = "Set B00T_SM0L_ENDPOINT for the from_artifact sm0l-oracle path only -- a different consumer, llama.cpp-native /completion, not OpenAI /v1"
 command = "export B00T_SM0L_ENDPOINT=http://192.168.1.137:30801/completion"
 
 [[b00t.usage]]

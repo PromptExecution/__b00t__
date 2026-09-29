@@ -25,86 +25,132 @@ pub enum DatumDispatch {
     Info(String),
 }
 
+// ── Dispatch Mode Trait Chain (#706) ─────────────────────────────────────
+//
+// Each datum kind resolves independently via `DispatchMode::try_resolve`.
+// `default_dispatch_chain()` is the ordered Vec<Box<dyn DispatchMode>> that
+// `resolve_all_datum_dispatches` walks; adding a new dispatch kind (e.g. a
+// future DockerMode or AgentMode) means appending a new implementor here,
+// not editing resolve_all_datum_dispatches' body. Cross-mode precedence
+// (e.g. "CLI is suppressed when a Runtime datum also matches") is NOT
+// encoded per-mode — it's handled uniformly afterward by the existing
+// `result_is_implied_by` stereotype filter, so modes stay independent.
+
+/// A single resolution strategy for `b00t <name>` dispatch.
+///
+/// `name()` (b00t SysML v2 spine consolidation, `elasticdotventures/_b00t_#1177`)
+/// lets `dispatch_sysml` classify each mode as a node without a second registry
+/// naming them again by hand — its default body derives the name straight from
+/// `std::any::type_name::<Self>()`, so a new implementor gets a correct `name()`
+/// for free just by being a distinctly-named unit struct; override it only if a
+/// mode ever needs a display name that isn't its own Rust type name.
+pub trait DispatchMode {
+    /// Stable identifier for this mode — used by `dispatch_sysml` to name it as a
+    /// node in the chain's SysML v2 / iso-IR representation, not by dispatch itself.
+    fn name(&self) -> &'static str {
+        std::any::type_name::<Self>()
+            .rsplit("::")
+            .next()
+            .unwrap()
+    }
+    /// Attempt to resolve `candidate` (looked up under `path`) into a dispatch action.
+    fn try_resolve(&self, candidate: &str, path: &str) -> Option<DatumDispatch>;
+}
+
+/// Try `{candidate}.{stem}.toml`, `.tomllmd`, `.tomllm` in order under `expanded`
+/// and return the first that exists (#1184) — every `DispatchMode` (plus
+/// `load_cli_datum` below) looks for its datum file the same way, differing only
+/// in `stem`; this is the one place that suffix list is spelled out.
+fn find_datum_file(expanded: &std::path::Path, candidate: &str, stem: &str) -> Option<std::path::PathBuf> {
+    [".toml", ".tomllmd", ".tomllm"]
+        .iter()
+        .map(|ext| expanded.join(format!("{candidate}.{stem}{ext}")))
+        .find(|p| p.exists())
+}
+
+struct RuntimeMode;
+impl DispatchMode for RuntimeMode {
+    fn try_resolve(&self, candidate: &str, path: &str) -> Option<DatumDispatch> {
+        let expanded = get_expanded_path(path).ok()?;
+        find_datum_file(&expanded, candidate, "runtime")?;
+        let cfg = load_runtime_datum(candidate, path).ok()?;
+        Some(DatumDispatch::Runtime(cfg))
+    }
+}
+
+struct CliPassthroughMode;
+impl DispatchMode for CliPassthroughMode {
+    fn try_resolve(&self, candidate: &str, path: &str) -> Option<DatumDispatch> {
+        let expanded = get_expanded_path(path).ok()?;
+        find_datum_file(&expanded, candidate, "cli")?;
+        let datum = load_cli_datum(candidate, path).ok()?;
+        let command = datum.command.unwrap_or_else(|| candidate.to_string());
+        let args: Vec<String> = datum.args.unwrap_or_default();
+        Some(DatumDispatch::CliPassthrough { command, args })
+    }
+}
+
+struct PolysemeMode;
+impl DispatchMode for PolysemeMode {
+    fn try_resolve(&self, candidate: &str, path: &str) -> Option<DatumDispatch> {
+        let expanded = get_expanded_path(path).ok()?;
+        find_datum_file(&expanded, candidate, "polyseme")?;
+        let refs = crate::load_polyseme_refs(candidate, path).ok()?;
+        Some(DatumDispatch::Polyseme {
+            name: candidate.to_string(),
+            refs,
+        })
+    }
+}
+
+struct OodaMode;
+impl DispatchMode for OodaMode {
+    fn try_resolve(&self, candidate: &str, path: &str) -> Option<DatumDispatch> {
+        let expanded = get_expanded_path(path).ok()?;
+        find_datum_file(&expanded, candidate, "ooda")?;
+        Some(DatumDispatch::Info(format!(
+            "ooda loop '{}' — run with: b00t ooda run {}",
+            candidate, candidate
+        )))
+    }
+}
+
+struct McpInfoMode;
+impl DispatchMode for McpInfoMode {
+    fn try_resolve(&self, candidate: &str, path: &str) -> Option<DatumDispatch> {
+        let expanded = get_expanded_path(path).ok()?;
+        find_datum_file(&expanded, candidate, "mcp")?;
+        Some(DatumDispatch::Info(format!(
+            "mcp datum '{}' — use 'b00t mcp list' or 'b00t mcp execute {} <tool>'",
+            candidate, candidate
+        )))
+    }
+}
+
+/// Ordered chain of dispatch strategies, tried in priority order
+/// (most-specific/actionable first). Extend by appending a new
+/// `Box<dyn DispatchMode>` implementor — no match-block edits required.
+pub fn default_dispatch_chain() -> Vec<Box<dyn DispatchMode>> {
+    vec![
+        Box::new(RuntimeMode),
+        Box::new(CliPassthroughMode),
+        Box::new(PolysemeMode),
+        Box::new(OodaMode),
+        Box::new(McpInfoMode),
+    ]
+}
+
 /// Search the datum space for `candidate` and resolve ALL matching dispatch actions.
 /// Returns multiple matches when a name is polysemous or has multiple datum types.
 pub fn resolve_all_datum_dispatches(candidate: &str, path: &str) -> Vec<DatumDispatch> {
-    let mut results = Vec::new();
-
-    let expanded = match get_expanded_path(path) {
-        Ok(p) => p,
-        Err(_) => return results,
-    };
-
-    // Runtime — if a runtime datum exists, it's the primary dispatch.
-    let mut has_runtime = false;
-    let runtime_suffixes = [".runtime.toml", ".runtime.tomllmd", ".runtime.tomllm"];
-    for suffix in &runtime_suffixes {
-        let p = expanded.join(format!("{candidate}{suffix}"));
-        if p.exists() {
-            if let Ok(cfg) = load_runtime_datum(candidate, path) {
-                results.push(DatumDispatch::Runtime(cfg));
-                has_runtime = true;
-                break;
-            }
-        }
+    if get_expanded_path(path).is_err() {
+        return Vec::new();
     }
 
-    // CLI — only auto-dispatched when NO runtime datum exists.
-    if !has_runtime {
-        let cli_suffixes = [".cli.toml", ".cli.tomllmd", ".cli.tomllm"];
-        for suffix in &cli_suffixes {
-            let p = expanded.join(format!("{candidate}{suffix}"));
-            if p.exists() {
-                if let Ok(datum) = load_cli_datum(candidate, path) {
-                    let cmd = datum.command.unwrap_or_else(|| candidate.to_string());
-                    let args: Vec<String> = datum.args.unwrap_or_default();
-                    results.push(DatumDispatch::CliPassthrough { command: cmd, args });
-                    break;
-                }
-            }
-        }
-    }
-
-    // Polyseme
-    let poly_suffixes = [".polyseme.toml", ".polyseme.tomllmd", ".polyseme.tomllm"];
-    for suffix in &poly_suffixes {
-        let p = expanded.join(format!("{candidate}{suffix}"));
-        if p.exists() {
-            if let Ok(refs) = crate::load_polyseme_refs(candidate, path) {
-                results.push(DatumDispatch::Polyseme {
-                    name: candidate.to_string(),
-                    refs,
-                });
-                break;
-            }
-        }
-    }
-
-    // OODA
-    let ooda_suffixes = [".ooda.toml", ".ooda.tomllmd", ".ooda.tomllm"];
-    for suffix in &ooda_suffixes {
-        let p = expanded.join(format!("{candidate}{suffix}"));
-        if p.exists() {
-            results.push(DatumDispatch::Info(format!(
-                "ooda loop '{}' — run with: b00t ooda run {}",
-                candidate, candidate
-            )));
-            break;
-        }
-    }
-
-    // MCP
-    let mcp_suffixes = [".mcp.toml", ".mcp.tomllmd", ".mcp.tomllm"];
-    for suffix in &mcp_suffixes {
-        let p = expanded.join(format!("{candidate}{suffix}"));
-        if p.exists() {
-            results.push(DatumDispatch::Info(format!(
-                "mcp datum '{}' — use 'b00t mcp list' or 'b00t mcp execute {} <tool>'",
-                candidate, candidate
-            )));
-            break;
-        }
-    }
+    let mut results: Vec<DatumDispatch> = default_dispatch_chain()
+        .iter()
+        .filter_map(|mode| mode.try_resolve(candidate, path))
+        .collect();
 
     // ── Stereotype hierarchy: eliminate less-specific matches ──────────────
     if results.len() > 1 {
@@ -178,16 +224,8 @@ pub fn prompt_polyseme_selection(name: &str, refs: &[PolysemeRef]) -> Option<Str
 /// Load a CLI datum and return its BootDatum.
 fn load_cli_datum(name: &str, path: &str) -> Result<BootDatum> {
     let expanded = get_expanded_path(path)?;
-    let suffixes = [".cli.toml", ".cli.tomllmd", ".cli.tomllm"];
-    let mut found = None;
-    for suffix in &suffixes {
-        let p = expanded.join(format!("{name}{suffix}"));
-        if p.exists() {
-            found = Some(p);
-            break;
-        }
-    }
-    let file_path = found.ok_or_else(|| anyhow::anyhow!("CLI datum '{name}' not found"))?;
+    let file_path = find_datum_file(&expanded, name, "cli")
+        .ok_or_else(|| anyhow::anyhow!("CLI datum '{name}' not found"))?;
     let content =
         std::fs::read_to_string(&file_path).context(format!("read {}", file_path.display()))?;
     let config: UnifiedConfig =
@@ -373,6 +411,7 @@ fn create_mcp_datum_from_json(
                             env: env.map(|s| s.to_string()),
                             rhai: rhai.map(|s| s.to_string()),
                             knowledge_backend: knowledge_backend.map(|s| s.to_string()),
+                            justfile: None,
                             hint,
                         })
                     })
@@ -1193,15 +1232,62 @@ fn select_mcp_method(
 
 // ── MCP Installation Functions ─────────────────────────────────────────
 
+/// Resolve command/args/env for an MCP install, including generic AI-backend
+/// provisioning: if `datum.ai_provision` is set, mints a b00t-server API key
+/// scoped to it (`b00t server key create`) and merges the resulting
+/// key/base-url into the env map on top of whatever static `env` the stdio
+/// method already declares. This is what makes provisioning "the default
+/// within b00t" for ANY MCP datum, not a rust-doc-specific special case —
+/// any future datum opts in by setting `[b00t.ai_provision]`.
+///
+/// Shells out to `b00t server key create` rather than linking b00t-mcp's
+/// LlmState in-process: b00t-mcp already depends on b00t-cli, so the reverse
+/// dependency would be circular. Same duct::cmd! pattern already used below
+/// for `claude mcp add-json` etc.
+fn resolve_provisioned_command_args_env(
+    datum: &BootDatum,
+) -> Result<(String, Vec<String>, Option<std::collections::HashMap<String, String>>)> {
+    let (command, args, static_env, _transport) = select_mcp_method(datum, None, false)?;
+
+    let mut env = static_env.unwrap_or_default();
+    if let Some(provision) = &datum.ai_provision {
+        let key_output = duct::cmd!(
+            "b00t",
+            "server",
+            "key",
+            "create",
+            "--consumer",
+            &datum.name,
+            "--access",
+            &provision.scope
+        )
+        .read()
+        .with_context(|| {
+            format!(
+                "failed to provision AI-backend key for '{}' (scope: {})",
+                datum.name, provision.scope
+            )
+        })?;
+        let key = key_output.trim().to_string();
+        env.insert(provision.inject_key_as.clone(), key);
+        env.insert(provision.inject_base_as.clone(), provision.server_url.clone());
+    }
+
+    Ok((command, args, if env.is_empty() { None } else { Some(env) }))
+}
+
 pub fn claude_code_install_mcp(name: &str, path: &str) -> Result<()> {
     let datum = crate::get_mcp_config(name, path)?;
-    let (command, args) = extract_mcp_command_args(&datum);
+    let (command, args, env) = resolve_provisioned_command_args_env(&datum)?;
 
-    let claude_json = serde_json::json!({
+    let mut claude_json = serde_json::json!({
         "name": datum.name,
         "command": command,
         "args": args
     });
+    if let Some(env) = env {
+        claude_json["env"] = serde_json::json!(env);
+    }
 
     let json_str =
         serde_json::to_string(&claude_json).context("Failed to serialize JSON for Claude Code")?;
@@ -1234,13 +1320,16 @@ pub fn claude_code_install_mcp(name: &str, path: &str) -> Result<()> {
 
 pub fn vscode_install_mcp(name: &str, path: &str) -> Result<()> {
     let datum = crate::get_mcp_config(name, path)?;
-    let (command, args) = extract_mcp_command_args(&datum);
+    let (command, args, env) = resolve_provisioned_command_args_env(&datum)?;
 
-    let vscode_json = serde_json::json!({
+    let mut vscode_json = serde_json::json!({
         "name": datum.name,
         "command": command,
         "args": args
     });
+    if let Some(env) = env {
+        vscode_json["env"] = serde_json::json!(env);
+    }
 
     let json_str =
         serde_json::to_string(&vscode_json).context("Failed to serialize JSON for VSCode")?;
@@ -1267,13 +1356,16 @@ pub fn vscode_install_mcp(name: &str, path: &str) -> Result<()> {
 
 pub fn gemini_install_mcp(name: &str, path: &str, use_repo: bool) -> Result<()> {
     let datum = crate::get_mcp_config(name, path)?;
-    let (command, args) = extract_mcp_command_args(&datum);
+    let (command, args, env) = resolve_provisioned_command_args_env(&datum)?;
 
-    let gemini_json = serde_json::json!({
+    let mut gemini_json = serde_json::json!({
         "name": datum.name,
         "command": command,
         "args": args
     });
+    if let Some(env) = env {
+        gemini_json["env"] = serde_json::json!(env);
+    }
 
     let json_str =
         serde_json::to_string(&gemini_json).context("Failed to serialize JSON for Gemini CLI")?;
@@ -1376,6 +1468,75 @@ pub fn codex_install_mcp(
     Ok(())
 }
 
+/// #1344: Build a `.mcp.json` server config for an httpstream MCP method.
+fn build_httpstream_server_config(
+    url: &str,
+    httpstream_data: Option<&std::collections::HashMap<String, serde_json::Value>>,
+) -> serde_json::Value {
+    let mut config = serde_json::json!({ "url": url });
+
+    let Some(data) = httpstream_data else {
+        config["type"] = serde_json::json!("http");
+        return config;
+    };
+
+    // client_type: "http" (default) or "sse"
+    let client_type = data
+        .get("client_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("http");
+    config["type"] = serde_json::json!(client_type);
+
+    // Build headers from all three sources
+    let has_auth = data
+        .get("bearer_token_env_var")
+        .and_then(|v| v.as_str())
+        .is_some()
+        || data
+            .get("http_headers")
+            .and_then(|v| v.as_object())
+            .is_some()
+        || data
+            .get("env_http_headers")
+            .and_then(|v| v.as_object())
+            .is_some();
+
+    if has_auth {
+        let mut headers = serde_json::Map::new();
+
+        // http_headers → literal passthrough (highest priority — explicit wins)
+        if let Some(hh) = data.get("http_headers").and_then(|v| v.as_object()) {
+            for (k, v) in hh {
+                headers.insert(k.clone(), v.clone());
+            }
+        }
+
+        // env_http_headers → interpolation: ${VAR} (second priority)
+        if let Some(ehh) = data.get("env_http_headers").and_then(|v| v.as_object()) {
+            for (k, v) in ehh {
+                if let Some(var_name) = v.as_str() {
+                    headers
+                        .entry(k.clone())
+                        .or_insert(serde_json::json!(format!("${{{}}}", var_name)));
+                }
+            }
+        }
+
+        // bearer_token_env_var → Authorization: Bearer ${VAR} (fallback)
+        if let Some(var_name) = data.get("bearer_token_env_var").and_then(|v| v.as_str()) {
+            headers
+                .entry("Authorization".to_string())
+                .or_insert(serde_json::json!(format!("Bearer ${{{}}}", var_name)));
+        }
+
+        if !headers.is_empty() {
+            config["headers"] = serde_json::Value::Object(headers);
+        }
+    }
+
+    config
+}
+
 pub fn dotmcpjson_install_mcp(
     name: &str,
     path: &str,
@@ -1388,15 +1549,7 @@ pub fn dotmcpjson_install_mcp(
     let repo_root = get_workspace_root();
     let mcp_json_path = std::path::Path::new(&repo_root).join(".mcp.json");
 
-    if !mcp_json_path.exists() {
-        anyhow::bail!("No .mcp.json file found in repo root: {}", repo_root);
-    }
-
-    let existing_content =
-        std::fs::read_to_string(&mcp_json_path).context("Failed to read .mcp.json file")?;
-
-    let mut mcp_config: serde_json::Value =
-        serde_json::from_str(&existing_content).context("Failed to parse .mcp.json file")?;
+    let mut mcp_config = load_or_initialize_dotmcpjson(&mcp_json_path)?;
 
     if !mcp_config.is_object() {
         mcp_config = serde_json::json!({});
@@ -1409,7 +1562,12 @@ pub fn dotmcpjson_install_mcp(
         select_mcp_method(&datum, stdio_command, use_httpstream)?;
 
     let server_config = if method_type == "httpstream" {
-        serde_json::json!({ "url": command })
+        // #1344: emit type/headers from bearer_token_env_var, http_headers, env_http_headers
+        let httpstream_data = datum
+            .mcp
+            .as_ref()
+            .and_then(|m| m.httpstream.as_ref());
+        build_httpstream_server_config(&command, httpstream_data)
     } else {
         serde_json::json!({ "command": command, "args": args })
     };
@@ -1445,6 +1603,22 @@ pub fn dotmcpjson_install_mcp(
 
     println!("📁 Updated: {}", mcp_json_path.display());
     Ok(())
+}
+
+/// Read an existing project MCP manifest or return its minimal valid shape.
+///
+/// A project-level install is the first writer in many repositories; requiring
+/// callers to create an otherwise-empty JSON file defeats the install command's
+/// purpose. Existing malformed files still fail closed rather than being
+/// replaced.
+fn load_or_initialize_dotmcpjson(path: &std::path::Path) -> Result<serde_json::Value> {
+    match std::fs::read_to_string(path) {
+        Ok(content) => serde_json::from_str(&content).context("Failed to parse .mcp.json file"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(serde_json::json!({ "mcpServers": {} }))
+        }
+        Err(error) => Err(error).context("Failed to read .mcp.json file"),
+    }
 }
 
 /// Install an MCP server to opencode's config (~/.config/opencode/opencode.json).
@@ -1667,5 +1841,172 @@ pub fn mcp_sync_bidirectional(
             )
         }
         _ => anyhow::bail!("Invalid operation '{}'", operation),
+    }
+}
+
+// ── Dispatch Mode Trait Chain (#706) tests ──────────────────────────────
+//
+// resolve_all_datum_dispatches() used to be a linear function that tried
+// runtime -> cli -> polyseme -> ooda -> mcp in sequence, inline. These
+// tests exercise the trait-based replacement: each datum kind is now an
+// independent `DispatchMode` implementor, and the chain is an ordered
+// Vec<Box<dyn DispatchMode>>. Adding a new dispatch kind means appending a
+// new implementor, not editing a match block.
+#[cfg(test)]
+mod dispatch_mode_tests {
+    use super::*;
+
+    #[test]
+    fn missing_dotmcpjson_is_initialized_with_an_empty_server_map() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = load_or_initialize_dotmcpjson(&directory.path().join(".mcp.json")).unwrap();
+
+        assert_eq!(config, serde_json::json!({ "mcpServers": {} }));
+    }
+
+    /// Proves the chain is extensible: a brand-new mode, defined entirely
+    /// in this test, participates in resolution without touching any of
+    /// the built-in modes or resolve_all_datum_dispatches' body.
+    struct AlwaysHitMode;
+    impl DispatchMode for AlwaysHitMode {
+        fn try_resolve(&self, candidate: &str, _path: &str) -> Option<DatumDispatch> {
+            Some(DatumDispatch::Info(format!("always-hit:{candidate}")))
+        }
+    }
+
+    #[test]
+    fn default_chain_has_one_mode_per_datum_kind() {
+        // Runtime, CliPassthrough, Polyseme, Ooda, Mcp
+        assert_eq!(default_dispatch_chain().len(), 5);
+    }
+
+    #[test]
+    fn chain_is_extensible_without_editing_existing_modes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+
+        // Nothing on disk matches any built-in mode.
+        let chain = default_dispatch_chain();
+        assert!(chain.iter().all(|m| m.try_resolve("nope", path).is_none()));
+
+        // Appending a new implementor is the only change needed to add a
+        // dispatch kind — no match block to edit.
+        let mut chain = default_dispatch_chain();
+        chain.push(Box::new(AlwaysHitMode));
+        let hit = chain.iter().find_map(|m| m.try_resolve("nope", path));
+        assert!(matches!(hit, Some(DatumDispatch::Info(_))));
+    }
+
+    #[test]
+    fn runtime_mode_matches_only_runtime_datum() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        std::fs::write(
+            dir.path().join("rt.runtime.toml"),
+            "[b00t]\nname = \"rt\"\ntype = \"runtime\"\n\n[b00t.runtime]\nbinary = \"/bin/true\"\n",
+        )
+        .unwrap();
+
+        assert!(matches!(
+            RuntimeMode.try_resolve("rt", path),
+            Some(DatumDispatch::Runtime(_))
+        ));
+        assert!(CliPassthroughMode.try_resolve("rt", path).is_none());
+    }
+
+    #[test]
+    fn cli_mode_matches_only_cli_datum() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        std::fs::write(
+            dir.path().join("c.cli.toml"),
+            "[b00t]\nname = \"c\"\ntype = \"cli\"\ncommand = \"echo\"\n",
+        )
+        .unwrap();
+
+        match CliPassthroughMode.try_resolve("c", path) {
+            Some(DatumDispatch::CliPassthrough { command, .. }) => assert_eq!(command, "echo"),
+            other => panic!("expected CliPassthrough, got {:?}", other.is_some()),
+        }
+        assert!(RuntimeMode.try_resolve("c", path).is_none());
+    }
+}
+
+// ── #1344: httpstream server config builder tests ─────────────────────
+#[cfg(test)]
+mod httpstream_config_tests {
+    use super::*;
+
+    #[test]
+    fn no_headers_defaults_to_type_http() {
+        let config = build_httpstream_server_config("http://example.com/mcp", None);
+        assert_eq!(config["url"], "http://example.com/mcp");
+        assert_eq!(config["type"], "http");
+        assert!(config.get("headers").is_none());
+    }
+
+    #[test]
+    fn client_type_sse_emitted() {
+        let mut data = std::collections::HashMap::new();
+        data.insert("client_type".to_string(), serde_json::json!("sse"));
+        let config = build_httpstream_server_config("http://example.com/mcp", Some(&data));
+        assert_eq!(config["type"], "sse");
+    }
+
+    #[test]
+    fn bearer_token_env_var_emits_authorization_header() {
+        let mut data = std::collections::HashMap::new();
+        data.insert(
+            "bearer_token_env_var".to_string(),
+            serde_json::json!("MY_API_TOKEN"),
+        );
+        let config = build_httpstream_server_config("http://example.com/mcp", Some(&data));
+        assert_eq!(
+            config["headers"]["Authorization"],
+            "Bearer ${MY_API_TOKEN}"
+        );
+    }
+
+    #[test]
+    fn http_headers_passthrough_literally() {
+        let mut data = std::collections::HashMap::new();
+        let mut hh = serde_json::Map::new();
+        hh.insert("X-API-Version".to_string(), serde_json::json!("2024-01"));
+        data.insert("http_headers".to_string(), serde_json::Value::Object(hh));
+        let config = build_httpstream_server_config("http://example.com/mcp", Some(&data));
+        assert_eq!(config["headers"]["X-API-Version"], "2024-01");
+    }
+
+    #[test]
+    fn env_http_headers_emit_interpolation() {
+        let mut data = std::collections::HashMap::new();
+        let mut ehh = serde_json::Map::new();
+        ehh.insert("X-Token".to_string(), serde_json::json!("MY_VAR"));
+        data.insert(
+            "env_http_headers".to_string(),
+            serde_json::Value::Object(ehh),
+        );
+        let config = build_httpstream_server_config("http://example.com/mcp", Some(&data));
+        assert_eq!(config["headers"]["X-Token"], "${MY_VAR}");
+    }
+
+    #[test]
+    fn explicit_authorization_wins_over_bearer_token() {
+        let mut data = std::collections::HashMap::new();
+        let mut hh = serde_json::Map::new();
+        hh.insert(
+            "Authorization".to_string(),
+            serde_json::json!("Basic dXNlcjpwYXNz"),
+        );
+        data.insert("http_headers".to_string(), serde_json::Value::Object(hh));
+        data.insert(
+            "bearer_token_env_var".to_string(),
+            serde_json::json!("SHOULD_BE_IGNORED"),
+        );
+        let config = build_httpstream_server_config("http://example.com/mcp", Some(&data));
+        assert_eq!(
+            config["headers"]["Authorization"],
+            "Basic dXNlcjpwYXNz"
+        );
     }
 }

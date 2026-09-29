@@ -1,0 +1,151 @@
+# Run the test suite on the GCP dstack build plane instead of ubuntu-latest.
+# Plan gleaming-jingling-nygaard — CI-on-the-build-plane, leverage #1.
+#
+# Two stages:
+#   build  — ONE Spot e2-standard-8 compiles the workspace once and publishes
+#            a relocatable `cargo nextest` archive + source tarball to GCS.
+#   test   — 4 compile-free Spot e2-standard-4 boxes each run one nextest
+#            partition from that archive. No rustc, no sccache, no rebuild.
+# Was 4x whole-workspace compiles; now 1x. `ci.yml` (ubuntu-latest) stays the
+# always-on fast path. Opt-in: `workflow_dispatch` or a PR labeled
+# `build-plane-ci`.
+#
+# --- TAILNET INGRESS (Phase 2.75) ----------------------------------------
+# The control node is tailnet-only: no external IP, and the Cloud Run pingap
+# waker was destroyed by `network_mode = "tailnet"`. A GitHub-hosted runner
+# therefore CANNOT reach the build plane until it joins the tailnet, which is
+# what the "Join the tailnet" step below does (b00t #196).
+#
+# Repo settings required (Settings -> Secrets and variables -> Actions).
+# Only true credentials are secrets; everything else is a variable:
+#   variable TS_OAUTH_CLIENT_ID  = Tailscale OAuth client id (not sensitive),
+#                                  scope `auth_keys`, may issue `tag:ci-runner`
+#   secret   TS_OAUTH_SECRET     = that client's secret
+#   secret   DSTACK_ADMIN_TOKEN  = the `token:` from ~/.dstack/server/config.yml
+#   variable DSTACK_URL          = the TAILNET waker address:
+#                                  `cd b00t-tf && tofu output -raw gcp_control_node_endpoint`
+#                                  in network_mode=tailnet -> http://100.109.101.1:8088
+#                                  (vultr1 k0s-pod waker — powers the
+#                                  scaled-to-zero control node on first call,
+#                                  ~90s, then proxies to dstack :3000).
+#   ( enrol repos with: just remote-enroll [--label] owner/repo … )
+#
+# Tailnet ACL (operator, one-time): own `tag:ci-runner` and grant it
+#   tcp:3000 -> tag:b00t-control-plane   (dstack API via the waker/proxy)
+#   tcp:8088 -> tag:vultr1               (the waker itself, cold-start)
+# An `authkey:`-based join also works — swap `oauth-client-id`/`oauth-secret`
+# for `authkey: ${{ secrets.TS_AUTHKEY }}` (ephemeral, preauthorized, tagged).
+name: ci-build-plane
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: git ref / sha to test
+        required: false
+  pull_request:
+    types: [labeled, synchronize, reopened]
+
+concurrency:
+  group: ci-build-plane-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  DSTACK_PROJECT: main
+  # one archive namespace per run attempt
+  ARCHIVE_KEY: ci-archives/${{ github.run_id }}-${{ github.run_attempt }}
+
+jobs:
+  build:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      contains(github.event.pull_request.labels.*.name, 'build-plane-ci')
+    runs-on: ubuntu-latest
+    outputs:
+      archive_key: ${{ env.ARCHIVE_KEY }}
+      ci_ref: ${{ steps.ref.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv tool install 'dstack[all]==0.21.5'
+      - id: ref
+        run: echo "sha=${{ github.event.pull_request.head.sha || inputs.ref || github.sha }}" >> "$GITHUB_OUTPUT"
+      - name: Join the tailnet
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ vars.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci-runner
+          hostname: ci-build-plane-build-${{ github.run_id }}
+      - name: Wake + point dstack at the build plane
+        env:
+          DSTACK_URL: ${{ vars.DSTACK_URL }}
+          DSTACK_ADMIN_TOKEN: ${{ secrets.DSTACK_ADMIN_TOKEN }}
+        run: |
+          # $DSTACK_URL is the tailnet waker (see header). Poke it first so the
+          # scaled-to-zero control node powers on, then retry `project add`
+          # while it finishes booting (~90s) and dstack :3000 comes up.
+          curl -fsS -m 240 --retry 8 --retry-all-errors -o /dev/null \
+            "$DSTACK_URL/api/projects" || true
+          ok=""
+          for i in $(seq 1 12); do
+            if dstack project add --name main --url "$DSTACK_URL" --token "$DSTACK_ADMIN_TOKEN"; then
+              ok=1; break
+            fi
+            echo "project add not ready yet (attempt $i) — sleeping 15s"; sleep 15
+          done
+          [ -n "$ok" ] || { echo "::error::control plane unreachable via $DSTACK_URL after retries"; exit 1; }
+      - name: Ensure the elastic GCP fleet exists
+        run: dstack apply -f dev-env/gcp-ci-fleet.yaml -y
+      - name: Build + archive (1 VM, 1 compile)
+        run: |
+          dstack apply -f dev-env/ci-build.task.yaml -n "ci-build-${GITHUB_RUN_ID}" \
+            -e CI_REF="${{ steps.ref.outputs.sha }}" \
+            -e CI_ARCHIVE_KEY="${ARCHIVE_KEY}" \
+            --yes
+
+  test:
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        partition: ["1/4", "2/4", "3/4", "4/4"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv tool install 'dstack[all]==0.21.5'
+      - name: Join the tailnet
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ vars.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci-runner
+          hostname: ci-build-plane-test-${{ github.run_id }}-p${{ strategy.job-index }}
+      - name: Wake + point dstack at the build plane
+        env:
+          DSTACK_URL: ${{ vars.DSTACK_URL }}
+          DSTACK_ADMIN_TOKEN: ${{ secrets.DSTACK_ADMIN_TOKEN }}
+        run: |
+          # The build job already woke the control node; the retry covers the
+          # case where the idle-reaper scaled it back down between stages.
+          curl -fsS -m 240 --retry 8 --retry-all-errors -o /dev/null \
+            "$DSTACK_URL/api/projects" || true
+          ok=""
+          for i in $(seq 1 12); do
+            if dstack project add --name main --url "$DSTACK_URL" --token "$DSTACK_ADMIN_TOKEN"; then
+              ok=1; break
+            fi
+            echo "project add not ready yet (attempt $i) — sleeping 15s"; sleep 15
+          done
+          [ -n "$ok" ] || { echo "::error::control plane unreachable via $DSTACK_URL after retries"; exit 1; }
+      - name: Ensure the elastic GCP fleet exists
+        run: dstack apply -f dev-env/gcp-ci-fleet.yaml -y
+      - name: Run partition ${{ matrix.partition }} from the archive (no compile)
+        run: |
+          NAME="ci-test-${GITHUB_RUN_ID}-p$(echo '${{ matrix.partition }}' | tr / -)"
+          dstack apply -f dev-env/ci-test.task.yaml -n "$NAME" \
+            -e CI_ARCHIVE_KEY="${{ needs.build.outputs.archive_key }}" \
+            -e CI_REF="${{ needs.build.outputs.ci_ref }}" \
+            -e NEXTEST_PARTITION="${{ matrix.partition }}" \
+            --yes
