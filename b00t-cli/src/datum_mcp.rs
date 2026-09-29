@@ -371,6 +371,7 @@ impl McpDatum {
                         || check_command_available("uvx")
                 }
                 "docker" => check_command_available("docker"),
+                "podman" => check_command_available("podman"),
                 "internet" => true, // TODO: Add actual internet check
                 constraint if constraint.starts_with("CMD:") => {
                     check_command_available(&constraint[4..])

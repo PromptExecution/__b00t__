@@ -1276,7 +1276,7 @@ fn resolve_provisioned_command_args_env(
     Ok((command, args, if env.is_empty() { None } else { Some(env) }))
 }
 
-pub fn claude_code_install_mcp(name: &str, path: &str) -> Result<()> {
+pub fn claude_code_install_mcp(name: &str, path: &str, use_repo: bool) -> Result<()> {
     let datum = crate::get_mcp_config(name, path)?;
     let (command, args, env) = resolve_provisioned_command_args_env(&datum)?;
 
@@ -1292,24 +1292,35 @@ pub fn claude_code_install_mcp(name: &str, path: &str) -> Result<()> {
     let json_str =
         serde_json::to_string(&claude_json).context("Failed to serialize JSON for Claude Code")?;
 
-    let result = duct::cmd!("claude", "mcp", "add-json", &datum.name, &json_str).run();
+    // #<podman-fix-2026-09-29>: `claude mcp add-json` defaults to `-s local`
+    // (private, per-user, stored in ~/.claude.json) when no scope is given.
+    // b00t previously never passed `-s` at all for the claudecode target, so
+    // there was no way to land a server in the repo-shared `.mcp.json`
+    // (`-s project`) the way Codex/Geminicli's `--repo` already can for
+    // their targets. `use_repo` picks "project" scope; callers default it
+    // from `crate::utils::is_git_repo()` the same way those targets do.
+    let scope = if use_repo { "project" } else { "local" };
+    let result = duct::cmd!(
+        "claude", "mcp", "add-json", &datum.name, &json_str, "-s", scope
+    )
+    .run();
 
     match result {
         Ok(_) => {
             println!(
-                "Successfully installed MCP server '{}' to Claude Code",
-                datum.name
+                "Successfully installed MCP server '{}' to Claude Code ({} scope)",
+                datum.name, scope
             );
             println!(
-                "Claude Code command: claude mcp add-json {} '{}'",
-                datum.name, json_str
+                "Claude Code command: claude mcp add-json {} '{}' -s {}",
+                datum.name, json_str, scope
             );
         }
         Err(e) => {
             eprintln!("Failed to install MCP server to Claude Code: {}", e);
             eprintln!(
-                "Manual command: claude mcp add-json {} '{}'",
-                datum.name, json_str
+                "Manual command: claude mcp add-json {} '{}' -s {}",
+                datum.name, json_str, scope
             );
             return Err(anyhow::anyhow!("Claude Code installation failed: {}", e));
         }

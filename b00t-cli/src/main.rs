@@ -2866,9 +2866,13 @@ async fn main() {
                         }
                         let target = "claudecode";
                         println!("🔌 Installing MCP server '{}' to {}...", filter, target);
+                        // Repo-scoped (`-s project`, shared via .mcp.json) when run
+                        // inside a git repo, same default `--mcp=<name>` targets
+                        // already lacked a way to opt into — mirrors Codex/Geminicli.
+                        let use_repo = b00t_cli::utils::is_git_repo();
                         // Try claude code; exit code 1 from `claude mcp add-json` usually
                         // means the server is already registered — treat as non-fatal.
-                        match claude_code_install_mcp(filter, &cli.path) {
+                        match claude_code_install_mcp(filter, &cli.path, use_repo) {
                             Ok(_) => println!("✅ Installed MCP server '{}' via --mcp", filter),
                             Err(e) => {
                                 let msg = e.to_string();

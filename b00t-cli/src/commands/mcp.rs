@@ -98,9 +98,15 @@ pub enum McpCommands {
         name: String,
         #[clap(value_enum, help = "Installation target")]
         target: McpInstallTarget,
-        #[clap(long, help = "Install to repository-specific location (for geminicli)")]
+        #[clap(
+            long,
+            help = "Install to repository-specific location (claudecode, codex, geminicli)"
+        )]
         repo: bool,
-        #[clap(long, help = "Install to user-global location (for geminicli)")]
+        #[clap(
+            long,
+            help = "Install to user-global location (claudecode, codex, geminicli)"
+        )]
         user: bool,
         #[clap(
             long,
@@ -381,7 +387,9 @@ fn handle_boot(
     } else {
         match target {
             "opencode" => crate::opencode_install_mcp("b00t-mcp", path, None, false)?,
-            "claudecode" | "claude" => crate::claude_code_install_mcp("b00t-mcp", path)?,
+            "claudecode" | "claude" => {
+                crate::claude_code_install_mcp("b00t-mcp", path, false)?
+            }
             "vscode" => crate::vscode_install_mcp("b00t-mcp", path)?,
             "codex" => {
                 crate::codex_install_mcp(
@@ -584,7 +592,18 @@ impl McpCommands {
                 }
 
                 match target {
-                    McpInstallTarget::Claudecode => crate::claude_code_install_mcp(name, path),
+                    McpInstallTarget::Claudecode => {
+                        let use_repo = if *repo && *user {
+                            anyhow::bail!("Error: Cannot specify both --repo and --user flags");
+                        } else if *repo {
+                            true
+                        } else if *user {
+                            false
+                        } else {
+                            crate::utils::is_git_repo()
+                        };
+                        crate::claude_code_install_mcp(name, path, use_repo)
+                    }
                     McpInstallTarget::Vscode => crate::vscode_install_mcp(name, path),
                     McpInstallTarget::Codex => {
                         let use_repo = if *repo && *user {
