@@ -13,13 +13,47 @@
 //! The child uses only async-signal-safe syscalls. Errors are communicated
 //! via a single-byte code written to the pre-fork pipe.
 
-use crate::{IsolationConfig, RuntimeConfig};
+use crate::{GateSpec, IsolationConfig, RuntimeConfig};
 use anyhow::{Result, anyhow, bail};
 use std::ffi::CString;
 
 /// Fork, launch sandboxed child, wait, run post-hook.
 /// Returns the child's exit status.
-pub fn spawn_sandboxed(config: &RuntimeConfig, passthrough_args: &[String]) -> Result<i32> {
+///
+/// `datum_path` is the datum directory (same `path` convention used by
+/// `evaluate_gates`/`GatePreconditions` elsewhere) — needed to resolve
+/// relative `file` gates. Pass whatever `path` was used to resolve the
+/// runtime datum in the first place.
+#[cfg(target_os = "linux")]
+pub fn spawn_sandboxed(
+    config: &RuntimeConfig,
+    passthrough_args: &[String],
+    datum_path: &str,
+) -> Result<i32> {
+    // ═══════ Gate preconditions (#712) ═══════
+    // RuntimeConfig previously carried no gate information at all, so a
+    // `requires_gpu`-style precondition on the datum went unchecked here —
+    // the sandbox would fork/exec and crash inside with a confusing runtime
+    // error instead of a clear pre-flight message. Reuses the same
+    // `evaluate_gates()` already relied on by `commands/install.rs` for the
+    // install path, applied here to the runtime dispatch path.
+    if let Some(gates) = &config.gate {
+        if !gates.is_empty() {
+            let results = crate::gates::evaluate_gates(gates, datum_path);
+            let failed: Vec<&str> = results
+                .iter()
+                .filter(|r| !r.passed)
+                .map(|r| r.reason.as_str())
+                .collect();
+            if !failed.is_empty() {
+                bail!(
+                    "gate precondition failed — sandbox launch blocked: {}",
+                    failed.join("; ")
+                );
+            }
+        }
+    }
+
     // ═══════ Pre-resolve everything in the PARENT (before fork) ═══════
     let binary = resolve_binary(&config.binary)?;
     let c_binary = CString::new(binary.clone()).map_err(|e| anyhow!("binary: {e}"))?;
@@ -113,7 +147,9 @@ pub fn spawn_sandboxed(config: &RuntimeConfig, passthrough_args: &[String]) -> R
 }
 
 // ── Child-only functions — async-signal-safe (no heap, no format, no alloc) ──
+// Linux-only: unshare(2)/mount(2)/prctl(2) below don't exist in macOS's libc.
 
+#[cfg(target_os = "linux")]
 fn child_sandbox(
     iso: &Option<IsolationConfig>,
     cwd: Option<&std::ffi::CStr>,
@@ -149,6 +185,7 @@ fn child_sandbox(
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn child_enter_namespaces(iso: &IsolationConfig) -> Result<(), u8> {
     let mut ns_flags = libc::CLONE_NEWNS;
 
@@ -171,6 +208,7 @@ fn child_enter_namespaces(iso: &IsolationConfig) -> Result<(), u8> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn child_mount_root() -> Result<(), u8> {
     if unsafe {
         libc::mount(
@@ -187,6 +225,7 @@ fn child_mount_root() -> Result<(), u8> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn child_apply_mounts(mounts: &[crate::MountEntry]) -> Result<(), u8> {
     for mnt in mounts {
         let src = CString::new(mnt.src.as_str()).map_err(|_| 4u8)?;
@@ -228,6 +267,7 @@ fn child_apply_mounts(mounts: &[crate::MountEntry]) -> Result<(), u8> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn child_bind_mount(
     src: &[u8],
     dest: &CString,
@@ -335,6 +375,7 @@ static ALL_CAPS: &[(&str, u32)] = &[
     ("CAP_CHECKPOINT_RESTORE", CAP_CHECKPOINT_RESTORE),
 ];
 
+#[cfg(target_os = "linux")]
 fn child_drop_capabilities(iso: &IsolationConfig) {
     let retain: std::collections::HashSet<&str> = iso
         .caps_retain
@@ -349,6 +390,21 @@ fn child_drop_capabilities(iso: &IsolationConfig) {
             }
         }
     }
+}
+
+/// Non-Linux stub — the real implementation forks and uses unshare(2)/
+/// mount(2)/prctl(2), none of which exist outside Linux. `resolve_binary`
+/// below stays portable/unguarded since the test suite exercises it on
+/// every platform independent of sandboxing support.
+#[cfg(not(target_os = "linux"))]
+pub fn spawn_sandboxed(
+    _config: &RuntimeConfig,
+    _passthrough_args: &[String],
+    _datum_path: &str,
+) -> Result<i32> {
+    bail!(
+        "sandboxed runtime execution requires Linux (namespace isolation via unshare(2)/mount(2)/prctl(2)); unsupported on this platform"
+    )
 }
 
 /// Resolve a binary name to an absolute path (searches PATH).
@@ -377,6 +433,7 @@ mod tests {
             isolation: None,
             hook_pre: None,
             hook_post: None,
+            gate: None,
         }
     }
 
@@ -414,7 +471,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn test_spawn_sandboxed_no_isolation() {
         let config = empty_runtime_config("/bin/true");
-        let exit_code = spawn_sandboxed(&config, &[]).expect("spawn_sandboxed should succeed");
+        let exit_code =
+            spawn_sandboxed(&config, &[], "/tmp").expect("spawn_sandboxed should succeed");
         assert_eq!(exit_code, 0, "/bin/true should exit 0, got {exit_code}");
     }
 
@@ -422,10 +480,49 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn test_spawn_sandboxed_binary_not_found() {
         let config = empty_runtime_config("__nonexistent_binary_xyz__");
-        let result = spawn_sandboxed(&config, &[]);
+        let result = spawn_sandboxed(&config, &[], "/tmp");
         assert!(
             result.is_err(),
             "expected error for nonexistent binary, got: {result:?}"
         );
+    }
+
+    // ── #712: gate preconditions must block sandbox dispatch ────────────
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_spawn_sandboxed_blocked_by_unmet_gate() {
+        // /bin/true would succeed on its own — proves the gate short-circuits
+        // BEFORE fork/exec, not that the binary itself failed.
+        let mut config = empty_runtime_config("/bin/true");
+        config.gate = Some(vec![GateSpec {
+            command: Some("__nonexistent_command_xyz__".to_string()),
+            ..Default::default()
+        }]);
+
+        let result = spawn_sandboxed(&config, &[], "/tmp");
+        assert!(
+            result.is_err(),
+            "expected unmet gate to block sandbox launch, got: {result:?}"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("gate precondition failed"),
+            "error should surface a clear gate pre-flight message, got: {err}"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_spawn_sandboxed_proceeds_when_gate_satisfied() {
+        let mut config = empty_runtime_config("/bin/true");
+        config.gate = Some(vec![GateSpec {
+            command: Some("sh".to_string()),
+            ..Default::default()
+        }]);
+
+        let exit_code = spawn_sandboxed(&config, &[], "/tmp")
+            .expect("satisfied gate should not block sandbox launch");
+        assert_eq!(exit_code, 0, "/bin/true should exit 0, got {exit_code}");
     }
 }

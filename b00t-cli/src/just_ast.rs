@@ -45,7 +45,7 @@ pub struct JustRecipe {
     /// Raw command body — complex nested structure from just's AST
     pub body: serde_json::Value,
     #[serde(default)]
-    pub dependencies: Vec<String>,
+    pub dependencies: Vec<JustDependency>,
     #[serde(default)]
     pub parameters: Vec<JustParameter>,
     #[serde(default)]
@@ -63,11 +63,38 @@ pub struct JustRecipe {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct JustParameter {
     pub name: String,
-    pub default: Option<String>,
+    /// A literal default is a plain JSON string, but just's dump format
+    /// represents a non-literal default (e.g. `image=SAM1_IMAGE`, referencing
+    /// another variable) as a nested AST array like `["variable", "NAME"]` —
+    /// same tagged-array shape `JustRecipe::body` and `JustAssignment::value`
+    /// already use. `Option<String>` rejects that shape outright.
+    pub default: Option<serde_json::Value>,
     #[serde(default)]
     pub export: bool,
     /// "singular" | "plus" (one-or-more) | "star" (zero-or-more)
     pub kind: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(untagged)]
+pub enum JustDependency {
+    Name(String),
+    Recipe {
+        recipe: String,
+        #[serde(default)]
+        arguments: Vec<serde_json::Value>,
+    },
+    Raw(serde_json::Value),
+}
+
+impl JustDependency {
+    pub fn name(&self) -> String {
+        match self {
+            JustDependency::Name(name) => name.clone(),
+            JustDependency::Recipe { recipe, .. } => recipe.clone(),
+            JustDependency::Raw(value) => value.to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]

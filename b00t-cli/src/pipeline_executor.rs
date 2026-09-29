@@ -12,9 +12,14 @@
 
 use crate::pipeline_cache::TimeoutPredictor;
 use crate::pipeline_checkpoint::{CheckpointStore, PipelineCheckpoint, compute_dag_hash};
-use crate::pipeline_flowctl::{FlowControl, FlowGate, StageFlowConfig};
+use b00t_pipeline_types::StageFlowConfig;
+use crate::pipeline_flowctl::{FlowControl, FlowGate};
 use crate::pipeline_logs::{LogLevel, LogStore, PipelineLogEntry};
 use crate::pipeline_nats::{NatsClientAdapter, NatsStageRouter};
+use crate::pipeline_remote_exec::RemoteExecutor;
+use crate::pipeline_scheduler::HostInfo;
+use crate::pipeline_statemachine::{PipelineEvent, StateMachine};
+use crate::pipeline_transitions::TransitionSink;
 use crate::pipeline_types::{PipelineDag, PipelineError, StagePort, StageSpec};
 use anyhow::Result;
 use chrono::Utc;
@@ -136,6 +141,13 @@ pub struct PipelineExecutor {
     checkpoint_store: Option<Arc<dyn CheckpointStore>>,
     flow_gates: HashMap<String, FlowGate>,
     timeout_predictor: Option<Arc<Mutex<TimeoutPredictor>>>,
+    transition_sink: Option<Arc<dyn TransitionSink>>,
+    /// Set together (`with_remote_execution`) — a stage only runs remotely
+    /// if it BOTH has a host assignment here AND an executor is configured.
+    /// See `pipeline_remote_exec.rs` (built by `pipeline_provision.rs`'s
+    /// `schedule_with_dynamic_provisioning`, or supplied directly).
+    remote_executor: Option<Arc<dyn RemoteExecutor>>,
+    host_assignments: HashMap<String, HostInfo>,
 }
 
 impl PipelineExecutor {
@@ -149,6 +161,9 @@ impl PipelineExecutor {
             flow_gates: HashMap::new(),
             checkpoint_store: None,
             timeout_predictor: None,
+            transition_sink: None,
+            remote_executor: None,
+            host_assignments: HashMap::new(),
         }
     }
 
@@ -185,6 +200,18 @@ impl PipelineExecutor {
         self
     }
 
+    /// Attach a transition sink (e.g. `FileTransitionLog`, `NatsTransitionSink`,
+    /// or a `MultiTransitionSink` fanning out to both).
+    ///
+    /// When set, `execute()` drives an internal `StateMachine` alongside its
+    /// existing `StageStatus`/`RunStatus` tracking, and every state
+    /// transition is recorded to this sink — a durable/live ledger of the
+    /// run's lifecycle, independent of and in parallel with `log_store`.
+    pub fn with_transition_sink(mut self, sink: Arc<dyn TransitionSink>) -> Self {
+        self.transition_sink = Some(sink);
+        self
+    }
+
     /// Attach flow-control gates between stages.
     ///
     /// Builds a `FlowGate` for each stage in the DAG that has a `flow_control`
@@ -210,6 +237,21 @@ impl PipelineExecutor {
     /// stage timing after completion.
     pub fn with_timeout_predictor(mut self, predictor: Arc<Mutex<TimeoutPredictor>>) -> Self {
         self.timeout_predictor = Some(predictor);
+        self
+    }
+
+    /// Enable real remote execution: stages with a matching entry in
+    /// `host_assignments` run via `executor` (SSH + podman, see
+    /// `pipeline_remote_exec.rs`) instead of `run_stage_fn`'s local
+    /// simulation. Stages with no assignment are unaffected — this is
+    /// additive, not a global mode switch.
+    pub fn with_remote_execution(
+        mut self,
+        executor: Arc<dyn RemoteExecutor>,
+        host_assignments: HashMap<String, HostInfo>,
+    ) -> Self {
+        self.remote_executor = Some(executor);
+        self.host_assignments = host_assignments;
         self
     }
 
@@ -332,6 +374,28 @@ impl PipelineExecutor {
             }
             0
         };
+
+        // ── State machine: drive PipelineState transitions in parallel with
+        // the StageStatus/RunStatus tracking above, recording each one via
+        // the optional transition_sink (durable file log +/or live NATS).
+        // This is a separate concern from StageStatus/RunStatus, not a
+        // replacement for them.
+        let mut sm = StateMachine::new(self.dag.clone()).with_run_id(run_id);
+        if let Some(sink) = &self.transition_sink {
+            sm = sm.with_transition_sink(sink.clone());
+        }
+        let _ = sm.transition(PipelineEvent::Validate);
+        let _ = sm.transition(PipelineEvent::Schedule);
+        let _ = sm.transition(PipelineEvent::Execute);
+        // Resuming from a checkpoint skips already-completed stages in the
+        // loop below (start_idx > 0) — fast-forward the state machine
+        // through synthetic StageComplete transitions so the ledger stays
+        // gap-free and still reaches `Completed`. These synthetic entries
+        // carry resume-time timestamps, not the stages' original completion
+        // times (accepted tradeoff).
+        for skip_idx in 0..start_idx {
+            let _ = sm.transition(PipelineEvent::StageComplete(skip_idx as u32));
+        }
 
         for (idx, stage_name) in order.iter().enumerate().skip(start_idx) {
             // Look up the stage spec.
@@ -493,7 +557,17 @@ impl PipelineExecutor {
 
             let is_failure = matches!(&result.status, StageStatus::Failed(_));
             let stage_output = result.output.clone();
+            let stage_error = result.error.clone();
             stage_results.push(result);
+
+            // ── State machine: record this stage's outcome as a transition ──
+            if is_failure {
+                let err = stage_error
+                    .unwrap_or_else(|| PipelineError::StageCrashed("unknown".into()));
+                let _ = sm.transition(PipelineEvent::StageFailed(err));
+            } else {
+                let _ = sm.transition(PipelineEvent::StageComplete(idx as u32));
+            }
 
             // ── Persist checkpoint after each completed stage ────────────
             if !is_failure {
@@ -809,8 +883,12 @@ impl PipelineExecutor {
     /// or invoke a Wasm capsule.  In this implementation it runs a simple
     /// closure based on the stage name, simulating work.
     ///
-    /// NOTE: This is intentionally simplistic for the MVP.  Real execution is
-    /// delegated to `JobExecutor` / `ComputeProvider` in a later milestone.
+    /// NOTE: This is the fallback path for any stage with no host
+    /// assignment / no remote executor configured. When both are set (via
+    /// `with_remote_execution` — a host from `schedule_with_dynamic_provisioning`,
+    /// see `pipeline_provision.rs`, or supplied directly), the stage
+    /// actually runs remotely instead — see the real-execution branch at
+    /// the top of this function and `pipeline_remote_exec.rs`.
     async fn run_stage_fn(
         &self,
         stage: &StageSpec,
@@ -824,6 +902,25 @@ impl PipelineExecutor {
                     stage: stage.name.clone(),
                     elapsed_ms: timeout_secs * 1000,
                 });
+            }
+        }
+
+        // Real remote execution, when this stage has both a host
+        // assignment and an executor configured (see
+        // `with_remote_execution` / `pipeline_remote_exec.rs`). Falls
+        // through to the local simulation below otherwise — this is
+        // additive, not a global mode switch, so every existing caller
+        // that never opted in behaves exactly as before.
+        if let Some(executor) = &self.remote_executor {
+            if let Some(host) = self.host_assignments.get(&stage.name) {
+                return crate::pipeline_remote_exec::execute_stage_remotely(
+                    executor.as_ref(),
+                    host,
+                    &stage.profile,
+                    input,
+                )
+                .await
+                .map_err(|e| PipelineError::StageCrashed(e.to_string()));
             }
         }
 

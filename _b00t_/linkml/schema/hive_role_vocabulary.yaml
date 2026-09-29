@@ -1,0 +1,75 @@
+id: https://promptexecution.com/b00t/linkml/hive-role-vocabulary
+name: hive-role-vocabulary
+description: >-
+  Canonical HiveCrew role identifiers — source of truth for
+  b00t-c0re-role's Worker/Executive/Operator/Specialist ZST role system
+  (moved here from b00t-cli/src/agentic_role.rs). Phase 2 ("harmonization")
+  of the ScopeStore+LinkML epic.
+
+  SCOPE — what this does and does not claim. It resolves _b00t_ issues
+  #905/#909's "no parallel vocabularies" goal for one specific collision:
+  agentic_role.rs's ZST role system vs b00t-c0re-hierarchy::Role, which
+  each defined an incompatible "operator". Those two are now merged into
+  this one taxonomy, consumed by both b00t-cli and b00t-c0re-hierarchy.
+  It does NOT unify every role-like vocabulary in the codebase — two
+  others remain untouched and out of scope: b00t-cli's RoleDetails /
+  *.role.toml datum system (an explicit non-goal of the unification), and
+  b00t-ipc's separate AgentRole { Specialist, Captain, Observer } enum,
+  which is wire-format-sensitive and belongs to a different subsystem.
+
+  RESOLVED COLLISION: the "operator" value below previously named two
+  different things — agentic_role.rs's "crew dispatch and specialist
+  routing" and b00t-c0re-hierarchy::Role::Operator's "recruitment +
+  training". Both are now the same role, one meaning: administrative
+  authority that recruits, trains, and dispatches other agents.
+
+  "provider"/"appprovider" is no longer a sealed role name. It survives
+  only as a common stereotype string within "specialist" (see that
+  value's description) — Specialist is an open-ended stereotype family,
+  Worker stays a single generalized name with no sub-stereotyping.
+
+prefixes:
+  linkml: https://w3id.org/linkml/
+  b00t: https://promptexecution.com/b00t/
+
+default_range: string
+default_prefix: b00t
+
+imports:
+  - linkml:types
+
+enums:
+  HiveRole:
+    description: >-
+      Canonical role identifiers within HiveCrew (b00t-c0re-role, the
+      single unified role taxonomy for both b00t-cli and
+      b00t-c0re-hierarchy). This schema is the source of truth going
+      forward — AgenticRole::NAME constants must match these permissible
+      value names exactly, checked by a coherence test in
+      b00t-c0re-role's own test module.
+    permissible_values:
+      worker:
+        description: >-
+          Default hive worker — general-purpose executor with
+          governance safety gates. A single generalized name, no
+          sub-stereotyping (contrast with specialist, below).
+      executive:
+        description: >-
+          Hive-level decision authority — release gate, tier routing,
+          resource management.
+      operator:
+        description: >-
+          Crew dispatch, recruitment, and specialist routing — spins
+          typed crews via k0mmand3r; administrative privileges (recruits,
+          trains, enlists agents). Previously two separate roles across
+          two parallel role systems; unified as one (#905/#909).
+      specialist:
+        description: >-
+          Domain-specific work — an open-ended stereotype family, not a
+          single fixed meaning. The bare "specialist" name covers
+          unspecified domain work; specific stereotypes (e.g.
+          "appprovider" for MCP surface/desktop control-plane/service
+          hosting, "rust-specialist", "security-auditor") resolve into
+          this same role type with their specific name preserved for
+          role-datum lookup, rather than each needing its own sealed
+          enum variant.

@@ -1,4 +1,4 @@
-use crate::agentic_role::resolve_role;
+use b00t_c0re_role::resolve_role;
 use crate::entanglement::parse_entanglement_ref;
 use crate::skill_resolver::SkillResolver;
 use crate::{get_config, get_expanded_path, DatumType, UnifiedConfig};
@@ -39,6 +39,7 @@ pub fn whoami(
     role_override: Option<String>,
     with_skills: bool,
     skills: Vec<String>,
+    full: bool,
 ) -> Result<()> {
     let expanded_path = get_expanded_path(path)?;
     let agent_md_path = expanded_path.join("AGENT.md");
@@ -50,20 +51,29 @@ pub fn whoami(
         );
     }
 
-    let template_content = fs::read_to_string(&agent_md_path).context(format!(
-        "Failed to read AGENT.md from {}",
-        agent_md_path.display()
-    ))?;
+    let role = resolve_role(role_override.clone());
+    let role_name = role.name();
 
-    // Use b00t-c0re-lib template renderer
-    let renderer =
-        TemplateRenderer::with_defaults().context("Failed to create template renderer")?;
+    // #1204: default output leads with the compact, connection-first summary
+    // (role, ACP channel, MCP surface via print_role_summary below) that a
+    // connecting agent actually needs. The full AGENT.md protocol boilerplate
+    // + AGENTS/--role=<role>.md supplement now live behind --full.
+    if full {
+        let template_content = fs::read_to_string(&agent_md_path).context(format!(
+            "Failed to read AGENT.md from {}",
+            agent_md_path.display()
+        ))?;
 
-    let rendered = renderer
-        .render(&template_content)
-        .context("Failed to render template")?;
+        // Use b00t-c0re-lib template renderer
+        let renderer =
+            TemplateRenderer::with_defaults().context("Failed to create template renderer")?;
 
-    println!("{}", rendered);
+        let rendered = renderer
+            .render(&template_content)
+            .context("Failed to render template")?;
+
+        println!("{}", rendered);
+    }
 
     // 🤓 P2: one-line node identity from soul — context-efficient preamble.
     //    Emits only highest-signal facts; agent runs `b00t soul get node.<key>`
@@ -72,20 +82,20 @@ pub fn whoami(
         println!("🥾 Node: {}  (detail: b00t soul get node.*)", node);
     }
 
-    // Append role supplement (AGENTS/--role=<role>.md) BEFORE role datum summary
-    let role = resolve_role(role_override.clone());
-    let role_name = role.name();
-    let supplement_candidates = [
-        std::path::PathBuf::from("AGENTS").join(format!("--role={}.md", role_name)),
-        dirs::home_dir()
-            .unwrap_or_default()
-            .join(".b00t/AGENTS")
-            .join(format!("--role={}.md", role_name)),
-    ];
-    for p in &supplement_candidates {
-        if let Ok(content) = fs::read_to_string(p) {
-            println!("\n{}", content);
-            break;
+    if full {
+        // Append role supplement (AGENTS/--role=<role>.md) BEFORE role datum summary
+        let supplement_candidates = [
+            std::path::PathBuf::from("AGENTS").join(format!("--role={}.md", role_name)),
+            dirs::home_dir()
+                .unwrap_or_default()
+                .join(".b00t/AGENTS")
+                .join(format!("--role={}.md", role_name)),
+        ];
+        for p in &supplement_candidates {
+            if let Ok(content) = fs::read_to_string(p) {
+                println!("\n{}", content);
+                break;
+            }
         }
     }
 
@@ -138,6 +148,11 @@ pub fn whoami(
         }
     }
 
+    if !full {
+        println!();
+        println!("ℹ️  Compact view — run `b00t whoami --full` for the complete AGENT.md protocol dump + role supplement.");
+    }
+
     Ok(())
 }
 
@@ -169,7 +184,7 @@ enum CapabilityStatus {
     InvalidReference,
 }
 
-fn load_role_datum(role: &str, path: &str) -> Option<RoleDetails> {
+pub fn load_role_datum(role: &str, path: &str) -> Option<RoleDetails> {
     // 🤓 prefer .role.tomllmd / .role.tomllm / .role.toml over other typed datums with same name
     let (config, _) = get_config_with_type_preference(role, &DatumType::Role, path).ok()?;
     let datum = config.b00t;
@@ -312,6 +327,12 @@ fn get_config_typed<'a>(
 fn print_role_summary(role: &RoleDetails, path: &str, with_skills: bool) {
     println!("🎭 Role: {}", role.name);
     println!("💡 {}", role.hint);
+    // #1204: ACP (Agent Coordination Protocol) address for this role, front-
+    // loaded since it's the concrete "how do I reach/address this agent"
+    // connection fact — previously computed but never printed anywhere.
+    if let Some(prefix) = &role.channel_prefix {
+        println!("📡 ACP channel: {}", prefix);
+    }
 
     if with_skills && !role.skills.is_empty() {
         // Resolve skill metadata for all declared skills (discovery tier)
@@ -815,6 +836,8 @@ pub fn build_dashboard() -> Vec<DashboardLayer> {
     inf.push(check_binary("ollama", "ollama --version"));
     inf.push(check_binary("llama.cpp", "llama-cli --version"));
     inf.push(detect_models());
+    inf.push(detect_candle_cuda());
+    inf.push(detect_model_server());
     layers.push(DashboardLayer {
         z: 2,
         name: "Inference",
@@ -1045,6 +1068,233 @@ fn detect_models() -> DashboardItem {
             DashboardStatus::Unknown
         },
         detail: format!("{} GGUF files", count),
+    }
+}
+
+/// Reports whether b00t-candle-serve (native Rust/candle local inference, currently
+/// serving Phi-4 — see phi.ai.tomllmd / phi-4-candle-local.model.ai.tomllmd) is
+/// running CUDA-capable, CPU-only-but-could-be-CUDA, or has no CUDA path at all.
+/// Distinct from the raw hardware `detect_gpu()` item above — this is specifically
+/// about whether the *binary* was actually built with candle's `cuda` feature, not
+/// just whether a GPU exists on the box (see `just phi-candle build-info`).
+fn detect_candle_cuda() -> DashboardItem {
+    let toolkit_present = command_output_with_timeout("nvcc", &["--version"], dashboard_probe_timeout())
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    let bin = dirs::home_dir()
+        .unwrap_or_default()
+        .join(".b00t/target/release/b00t-candle-serve");
+    if !bin.exists() {
+        return DashboardItem {
+            label: "Candle CUDA".into(),
+            status: DashboardStatus::Unknown,
+            detail: if toolkit_present {
+                "not built yet (CUDA toolkit present — `just phi-candle build` will use it)".into()
+            } else {
+                "not built yet — `just phi-candle build`".into()
+            },
+        };
+    }
+
+    let build_info = command_output_with_timeout(
+        bin.to_str().unwrap_or("b00t-candle-serve"),
+        &["--print-build-info"],
+        dashboard_probe_timeout(),
+    )
+    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    .unwrap_or_default();
+
+    match build_info.as_str() {
+        "cuda" => DashboardItem {
+            label: "Candle CUDA".into(),
+            status: DashboardStatus::Ready,
+            detail: "b00t-candle-serve built with CUDA — GPU used when free, CPU fallback otherwise".into(),
+        },
+        "cpu" if toolkit_present => DashboardItem {
+            label: "Candle CUDA".into(),
+            status: DashboardStatus::Warning,
+            detail: "CUDA toolkit available but binary is CPU-only — rebuild: just phi-candle build".into(),
+        },
+        _ => DashboardItem {
+            label: "Candle CUDA".into(),
+            status: DashboardStatus::Unknown,
+            detail: "CPU-only (no CUDA toolkit detected on this box)".into(),
+        },
+    }
+}
+
+/// ─── Local model server status (issue #962) ─────────────────────────────────
+///
+/// Classifies whether a local OpenAI-compatible inference endpoint — the
+/// mistralrs-proxy gateway on `:1234` (`_b00t_/mistralrs-proxy.hive.toml`) or
+/// the ch0nky llama.cpp container on `:8001`
+/// (`_b00t_/inference-qwen36-35b-a3b-llamacpp.hive.toml`) — is actually
+/// usable right now, vs merely possible on this node. Kept as a pure
+/// function over `ModelServerProbe` so the classification logic is
+/// unit-testable without a real GPU or a real listening port;
+/// `probe_model_server()` does the (untestable-in-CI) real-world probing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelServerStatus {
+    /// A known local inference endpoint responds on its configured port right now.
+    Running,
+    /// Built/configured and startable (binary/image present, GPU free) but not running.
+    Ready,
+    /// GPU/hardware present and idle, but no local server built/configured yet.
+    Feasible,
+    /// No compatible GPU/hardware on this node, or explicitly disabled.
+    Unavailable,
+}
+
+impl ModelServerStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ModelServerStatus::Running => "running",
+            ModelServerStatus::Ready => "ready",
+            ModelServerStatus::Feasible => "feasible",
+            ModelServerStatus::Unavailable => "unavailable",
+        }
+    }
+}
+
+/// Independently-probed facts feeding classification. `probe_model_server()`
+/// fills these from real commands (nvidia-smi / curl / which); tests supply
+/// fabricated combinations directly, without touching real hardware or ports.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ModelServerProbe {
+    /// GPU/hardware present on this node (regardless of current utilization).
+    pub gpu_present: bool,
+    /// mistralrs-proxy gateway (`:1234`) answers a `/v1/models` request right now.
+    pub gateway_responding: bool,
+    /// ch0nky llama.cpp inference container (`:8001`) answers right now.
+    pub inference_responding: bool,
+    /// A local server is built/configured and startable (binary or image present).
+    pub server_built: bool,
+}
+
+/// Pure classification — see `ModelServerStatus` variants for precedence:
+/// responding now beats merely built, beats merely feasible.
+pub fn classify_model_server(probe: &ModelServerProbe) -> ModelServerStatus {
+    if probe.gateway_responding || probe.inference_responding {
+        ModelServerStatus::Running
+    } else if probe.server_built {
+        ModelServerStatus::Ready
+    } else if probe.gpu_present {
+        ModelServerStatus::Feasible
+    } else {
+        ModelServerStatus::Unavailable
+    }
+}
+
+/// Configured ports for the two known local inference endpoints — see
+/// `_b00t_/mistralrs-proxy.hive.toml` and
+/// `_b00t_/inference-qwen36-35b-a3b-llamacpp.hive.toml`.
+const MODEL_GATEWAY_PORT: u16 = 1234; // mistralrs-proxy
+const MODEL_INFERENCE_PORT: u16 = 8001; // ch0nky llama.cpp container
+
+/// Probe an OpenAI-compatible `/v1/models` endpoint via curl — mirrors
+/// `doctor_cmd::check_model_endpoint`'s pattern (curl over reqwest, to avoid
+/// pulling an async runtime into this sync CLI path).
+fn probe_http_models_ok(port: u16) -> bool {
+    command_output_with_timeout(
+        "curl",
+        &[
+            "-s",
+            "--max-time",
+            "2",
+            "-o",
+            "/dev/null",
+            "-w",
+            "%{http_code}",
+            &format!("http://127.0.0.1:{}/v1/models", port),
+        ],
+        dashboard_probe_timeout(),
+    )
+    .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "200")
+    .unwrap_or(false)
+}
+
+/// True if a compatible local GPU (NVIDIA, via nvidia-smi) is present on
+/// this node. Mirrors `detect_gpu()`'s probe.
+fn probe_gpu_present() -> bool {
+    command_output_with_timeout(
+        "nvidia-smi",
+        &["--query-gpu=name", "--format=csv,noheader"],
+        dashboard_probe_timeout(),
+    )
+    .map(|o| o.status.success() && !String::from_utf8_lossy(&o.stdout).trim().is_empty())
+    .unwrap_or(false)
+}
+
+/// True if a local model server is built/startable: the mistralrs gateway
+/// binary or a llama.cpp server binary is on PATH, or the stock llama.cpp
+/// container image has been pulled (see
+/// `_b00t_/llama-cpp-server.container.toml`).
+fn probe_model_server_built() -> bool {
+    let present = |cmd: &str| {
+        command_output_with_timeout(cmd, &["--version"], dashboard_probe_timeout()).is_some()
+    };
+    if present("mistralrs") || present("llama-server") || present("llama-cli") {
+        return true;
+    }
+    command_output_with_timeout(
+        "podman",
+        &["image", "exists", "ghcr.io/ggml-org/llama.cpp:server"],
+        dashboard_probe_timeout(),
+    )
+    .map(|o| o.status.success())
+    .unwrap_or(false)
+}
+
+/// Real-world probe feeding `classify_model_server`. Not unit-tested
+/// directly (requires real GPU/curl/podman state on the host); the
+/// classification logic it feeds is tested exhaustively via fabricated
+/// `ModelServerProbe` fixtures instead.
+fn probe_model_server() -> ModelServerProbe {
+    ModelServerProbe {
+        gpu_present: probe_gpu_present(),
+        gateway_responding: probe_http_models_ok(MODEL_GATEWAY_PORT),
+        inference_responding: probe_http_models_ok(MODEL_INFERENCE_PORT),
+        server_built: probe_model_server_built(),
+    }
+}
+
+/// Public entry point for callers outside this module (e.g. `whoami --json`)
+/// that just need the classification, not the dashboard rendering.
+pub fn model_server_status() -> ModelServerStatus {
+    classify_model_server(&probe_model_server())
+}
+
+fn detect_model_server() -> DashboardItem {
+    let probe = probe_model_server();
+    let status = classify_model_server(&probe);
+    let detail = match status {
+        ModelServerStatus::Running => {
+            let mut which = Vec::new();
+            if probe.gateway_responding {
+                which.push(format!("gateway :{}", MODEL_GATEWAY_PORT));
+            }
+            if probe.inference_responding {
+                which.push(format!("inference :{}", MODEL_INFERENCE_PORT));
+            }
+            format!("running — {}", which.join(", "))
+        }
+        ModelServerStatus::Ready => format!(
+            "ready — built, not running (start via mistralrs-proxy :{} or ch0nky :{})",
+            MODEL_GATEWAY_PORT, MODEL_INFERENCE_PORT
+        ),
+        ModelServerStatus::Feasible => "feasible — GPU idle, no local server built yet".into(),
+        ModelServerStatus::Unavailable => "unavailable — no compatible GPU detected".into(),
+    };
+    DashboardItem {
+        label: "Local Model Server".into(),
+        status: match status {
+            ModelServerStatus::Running => DashboardStatus::Ready,
+            ModelServerStatus::Ready => DashboardStatus::Warning,
+            ModelServerStatus::Feasible => DashboardStatus::Unknown,
+            ModelServerStatus::Unavailable => DashboardStatus::Critical,
+        },
+        detail,
     }
 }
 
@@ -1865,5 +2115,116 @@ hint = "ralph mcp"
         let output = "no tasks found\n";
         let tasks = parse_task_list_output(output);
         assert!(tasks.is_empty());
+    }
+
+    // ─── Model server status tests (#962) ──────────────────────────────
+
+    #[test]
+    fn test_model_server_running_when_gateway_responds() {
+        let probe = ModelServerProbe {
+            gpu_present: true,
+            gateway_responding: true,
+            inference_responding: false,
+            server_built: true,
+        };
+        assert_eq!(classify_model_server(&probe), ModelServerStatus::Running);
+    }
+
+    #[test]
+    fn test_model_server_running_when_inference_responds() {
+        // Gateway down but the ch0nky llama.cpp container answers — still "running".
+        let probe = ModelServerProbe {
+            gpu_present: true,
+            gateway_responding: false,
+            inference_responding: true,
+            server_built: true,
+        };
+        assert_eq!(classify_model_server(&probe), ModelServerStatus::Running);
+    }
+
+    #[test]
+    fn test_model_server_running_takes_precedence_over_built_and_gpu() {
+        // Even if server_built/gpu_present were somehow false, a live port answer wins.
+        let probe = ModelServerProbe {
+            gpu_present: false,
+            gateway_responding: true,
+            inference_responding: false,
+            server_built: false,
+        };
+        assert_eq!(classify_model_server(&probe), ModelServerStatus::Running);
+    }
+
+    #[test]
+    fn test_model_server_ready_when_built_but_not_responding() {
+        let probe = ModelServerProbe {
+            gpu_present: true,
+            gateway_responding: false,
+            inference_responding: false,
+            server_built: true,
+        };
+        assert_eq!(classify_model_server(&probe), ModelServerStatus::Ready);
+    }
+
+    #[test]
+    fn test_model_server_feasible_when_gpu_present_but_nothing_built() {
+        let probe = ModelServerProbe {
+            gpu_present: true,
+            gateway_responding: false,
+            inference_responding: false,
+            server_built: false,
+        };
+        assert_eq!(classify_model_server(&probe), ModelServerStatus::Feasible);
+    }
+
+    #[test]
+    fn test_model_server_unavailable_when_no_gpu_and_nothing_built() {
+        let probe = ModelServerProbe::default();
+        assert_eq!(
+            classify_model_server(&probe),
+            ModelServerStatus::Unavailable
+        );
+    }
+
+    #[test]
+    fn test_model_server_unavailable_takes_precedence_when_not_responding_or_built() {
+        // No GPU, nothing built, nothing responding — unavailable regardless
+        // of any other combination not already covered above.
+        let probe = ModelServerProbe {
+            gpu_present: false,
+            gateway_responding: false,
+            inference_responding: false,
+            server_built: false,
+        };
+        assert_eq!(
+            classify_model_server(&probe),
+            ModelServerStatus::Unavailable
+        );
+    }
+
+    #[test]
+    fn test_model_server_status_as_str_matches_issue_962_vocabulary() {
+        assert_eq!(ModelServerStatus::Running.as_str(), "running");
+        assert_eq!(ModelServerStatus::Ready.as_str(), "ready");
+        assert_eq!(ModelServerStatus::Feasible.as_str(), "feasible");
+        assert_eq!(ModelServerStatus::Unavailable.as_str(), "unavailable");
+    }
+
+    #[test]
+    fn test_detect_model_server_is_present_in_inference_layer() {
+        // Real-world smoke test: this node may or may not have a GPU/server,
+        // but the dashboard item must always be produced without panicking
+        // and must carry a non-empty label/detail (see
+        // test_dashboard_status_display_consistency for the general check).
+        let layers = build_dashboard();
+        let inference = layers
+            .iter()
+            .find(|l| l.name == "Inference")
+            .expect("Inference layer missing");
+        let item = inference
+            .items
+            .iter()
+            .find(|i| i.label == "Local Model Server")
+            .expect("Local Model Server item missing from Inference layer");
+        assert!(!item.detail.is_empty());
     }
 }

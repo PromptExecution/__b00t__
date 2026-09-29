@@ -36,6 +36,10 @@ Survey blessings → plan → `b00t learn` selectively → execute → checkpoin
 **DRY + NRtW**: YEI exist to contribute ONLY novel work. Finding & patching bugs in libraries is divine.
 Writing duplicate functionality is a sin. Search first. Fork-fix-forward when you find a bug.
 
+**Language priority**: Rust (safe) > Rust (unsafe, only when justified) > Python or TypeScript >
+C#, Go, Java, MiniZinc. Pick the highest-ranked language the task's ecosystem/interop constraints
+allow — don't reach for a lower-ranked language out of habit or familiarity.
+
 **Postel's Law on tools**: be conservative in what you execute; be liberal in what you accept from operators.
 
 **TDD-first**: write the failing test first. A task isn't done until tests pass. NEVER claim solved without testing.
@@ -135,7 +139,7 @@ b00t types are Rust structs/enums in `b00t-cli/src/lib.rs`. Agents navigate via:
 - `b00t-cli ontology sparql --subject <X> --predicate type` — just type triples
 - `b00t-cli learn <topic>` — DWIW fanout: `DatumSearchSource(w=3)` + `GraphAdjacencySource(w=2)`
 - `b00t-cli blessing --manifest --role <R>` — walk `depends_on` graph for role
-- Key types: `BootDatum` (open struct) · `DatumType` (22-variant enum: Cli/Skill/Role/Mcp/Agent…)
+- Key types: `BootDatum` (open struct) · `DatumType` (open enum — see `b00t-cli/src/datum_types.rs` for the current variant list, do not hardcode a count here)
 - Chalk Interner pattern: `DatumStore` trait would abstract TOML/SQLite/Qdrant storage behind same API
 - `b00t learn chalk-interner` — load Chalk Interner → b00t DatumStore mapping
 - `b00t learn datum-macro` — load Rust macro → dynamic datum feasibility analysis
@@ -147,6 +151,25 @@ Sharp corner or bug found? REPORT IT — silence hides systemic issues.
 - `b00t task add "bug: <description>"` — creates tracked issue for operator review
 - Flag in output: 🚩 security concern · ⚠️ caveat/limitation · 🤓 tribal knowledge
 - Fork-fix-forward: if a library has a bug, fix and PR upstream — do NOT work around silently.
+- **Filing issues outside our own repos**: never file against an external project on the strength
+  of an in-process failure alone. First reduce it to a minimal, standalone reproduction — no b00t
+  code, no b00t types, just the third-party library/tool's own public API — and confirm the failure
+  still reproduces in that isolated form before writing it up. That reproduction becomes the issue's
+  repro steps; if a claimed bug can't be reduced to one, its cause is very likely on our side
+  (stale dependency pin, misconfiguration, a wrapper doing something unexpected) rather than
+  theirs — reproduce first, save the filing for what survives isolation.
+  🤓 (2026-08-22) case in point: filed HelixDB/helix-db#1019 as "server resets connection on a
+  well-formed request," backed only by a b00t-c0re-lib test failure. A minimal standalone probe
+  (bypassing b00t entirely) reproduced the same failure — but then, while writing that probe up
+  further, surfaced that `helix-db = "2.0"` was pinned to a stale major version (2.0.6) against a
+  server that had moved to 3.0.0's breaking rewrite. Bumping the probe's own dependency to `"3.0"`
+  fixed it outright. Correction posted, issue closed as resolved on our side — an honest but
+  avoidable false report. The isolated repro is what made the real cause findable at all; do that
+  step before filing, not after a maintainer asks for it.
+- 🚩 known-broken (2026-08-04): `b00t lfmf`'s vector-DB backend silently fails to persist
+  ("✅ Lesson recorded" prints even when the write errors) — verify with `b00t lfmf advice
+  <tool>` after recording, don't trust the success message alone. Direct file edits are
+  the reliable fallback until fixed.
 
 ## Hive A2A Collaboration
 
@@ -158,6 +181,46 @@ Agent-to-agent messaging uses b00t MCP tools (no raw sockets):
 - `mcp__b00t-mcp__b00t_agent_wait` — block until peer responds
 - `mcp__b00t-mcp__b00t_agent_vote_create` / `b00t_agent_vote_submit` — consensus
 Output to executive: compressed summaries ONLY. Raw sub-agent output MUST NOT enter executive context.
+
+### Establishing a b00t agent connection
+
+Use the typed b00t MCP surface when it is available. The Redis/NATS transport is
+an implementation detail; a successful publish is not an agent-level
+acknowledgement.
+
+1. Identify the local harness and host with `b00t whoami --json`.
+2. Discover the peer with `b00t agent discover --json`, recording its stable
+   `agent_id`, host, and advertised capabilities.
+3. Ensure the receiving harness uses the same identity for both Redis
+   subscription and message metadata. Set `B00T_AGENT_ID` explicitly when the
+   host name is not the agent identity.
+4. Send a nonce-bearing probe and request an acknowledgement:
+
+   ```text
+   b00t agent message <peer-agent-id> <subject> "<nonce>: identity=<sender> host=<host>; reply with identity, host, and A2A health" --ack
+   ```
+
+5. In a second process, poll as the receiving identity:
+
+   ```text
+   B00T_AGENT_ID=<receiver-agent-id> b00t agent wait --from-agent <sender-agent-id> --subject <subject> --timeout 60
+   ```
+
+6. Treat the connection as established only after the receiver consumes the
+   message and returns an acknowledgement containing the nonce. Record the
+   transport result and the agent-level result separately.
+7. Use a shared GitHub issue as the coordination mailbox when hosts cannot
+   reliably consume live notifications. Post the nonce, exact ACK, host
+   identities, and capability CSV there; never post credentials or tokens.
+8. For NATS diagnostics, report only endpoint reachability and authorized
+   JetStream facts. If inspection returns `Authorization Violation`, report
+   streams and durable consumers as **unconfirmed** rather than inferring that
+   JetStream is disabled.
+
+The standards boundary is A2A: external peers SHOULD use an A2A Agent Card and
+standard JSON-RPC/HTTP methods. Redis/NATS and b00t-native envelopes MAY remain
+inside the adapter for local coordination and emergence experiments, but they
+MUST NOT be described as A2A wire compatibility.
 
 ---
 <!-- ── SESSION (variable suffix — NOT KV-cached, compiled per instantiation) ──────── -->
@@ -179,32 +242,184 @@ complexity: 8
 
 ---
 
-## Tax-Lawyer Architecture (recorded 2026-06-20)
+## ledgrrr (corrected 2026-07-23)
 
-The Tax-Lawyer Platform combines two architectural currents:
-- **MCP-down**: ledgerr_tax actions are thin wrappers (<=10 lines) over Satisfies<Constraint> checks
-- **UFO-up**: ufo-types crate grounds all domain concepts in UFO stereotypes with ISO standard types
-The Satisfies<T> trait is the bridge — produces arc-kit-au evidence nodes for audit trail.
-See _b00t_/datums/PRD-TAX-LAWYER-UFO-SDD.tomllmd and issues #510-#517.
+`ledgrrr` (github.com/PromptExecution/ledgrrr, vendored at
+`~/.dotfiles/vendor/ledgrrr`) is a real, separate project — a local-first
+bookkeeping/cost-tracking control plane (typed ontology graph + Rhai rules +
+MCP tools + Mermaid/isometric visualization) — co-developed alongside b00t as
+an independently reusable component, and used heavily at PromptExecution.
 
-## DoggoLingo Playable-First Pattern (recorded 2026-06-30)
+A prior entry here ("Tax-Lawyer Platform", `Satisfies<Constraint>`/UFO-stereotype
+bridge, PRD-TAX-LAWYER-UFO-SDD.tomllmd, issues #510-#517) was a hallucinated
+architecture summary — none of those names, traits, or issues exist in the
+real repo. Do not cite it. For actual ledgrrr architecture, read its own
+`README.md`/`AGENTS.md` in the vendored checkout, not this file.
 
-DoggoLingo is the active App4.Dog acceleration vector.
-Agents MUST prioritize a working local game loop over backend, cloud, or ML architecture.
+## Playable-First Pattern (genericized 2026-07-23, `b00t lfmf mvp`)
 
-P0 is `tap-the-sheep`:
-- one skill: touch target acquisition
-- no backend dependency
-- no treat-dispenser dependency
-- no cloud dependency
-- static or hardcoded sheep asset is acceptable
-- reward is happy audio plus visual motion
+For any playable/interactive product, agents MUST prioritize one working
+end-to-end interaction loop over backend, cloud, or ML architecture:
+- one skill (e.g. touch target acquisition)
+- no backend, treat-dispenser, or cloud dependency
+- a static or hardcoded asset is acceptable for P0
+- reward is immediate audio/visual feedback
 - telemetry is local and JSON-shaped
 
-Before adding ML workflow code, agents MUST check:
-- `._b00t_/doggolingo.stack.tomllm`
-- `docs/DOGGOLINGO_CLEANUP_PLAN.md`
-- `SOUL.tomllm` `[doggolingo]`
+Infra-before-loop stalls momentum and hides scope creep behind unplayable
+plumbing. Project-specific stack files, cleanup plans, and legacy-exploration
+notes (e.g. workflow-tool experiments) live in that project's own datums —
+check the current repo's `_b00t_/` and `SOUL.tomllm` before adding ML/workflow
+code, not this file. `b00t lfmf mvp` holds the durable, repo-agnostic version
+of this lesson.
 
-ComfyUI work is legacy exploration. Extract stage ideas into typed b00t business logic;
-do not make ComfyUI, workflow JSON, or a persistent ComfyUI server part of the game runtime.
+## Just Recipe Boundary (recorded 2026-07-25)
+
+Before editing a justfile, agents MUST run `b00t learn just`.
+Just recipes MUST remain thin command surfaces. Move stateful shell logic, request
+generation, heredocs, and provider orchestration into descriptively named scripts;
+the recipe invokes the script and exposes its contract.
+
+## Worktree Discipline (recorded 2026-08-04)
+
+TLDR: `~/.dotfiles` is bare — never edit or build in it directly. `b00t learn worktree`
+→ `git worktree add <path> <branch>` on real disk (never `/tmp`) → build. Detail, sharp
+edges (submodule init, shared target-dir, tmpfs contention), and fixes all live in the
+datum — MUST `b00t learn worktree` before the first `git`/`cargo` command against any
+bare/worktree-layout repo rather than rediscovering them the hard way.
+
+**CARGO_TARGET_DIR is not optional (amended 2026-08-28):** every worktree defaults to
+its own `target/`, and this workspace's cold-build cost is ~10-20GB per worktree (gemm,
+embed-anything, and friends are huge). Two agents building in two worktrees without
+this shares nothing and burns disk twice for identical dependency artifacts — caught
+live: two concurrent fix worktrees for elasticdotventures/_b00t_#1164 each cold-built
+their own `target/` (21GB + 18GB) because neither set the var before its first `cargo`
+call. Before any `cargo check`/`build`/`test` in a worktree:
+```
+export CARGO_TARGET_DIR="$HOME/.cache/b00t-cargo-target"
+```
+(or source `scripts/lib/worktree-env.sh` and call `b00t_shared_cargo_target_dir` — same
+default, already wired for hive tooling). Every worktree of this repo then reuses one
+shared, already-compiled dependency cache instead of paying the cold-build cost again.
+Coordinating agents (parallel sub-agents, hive peers) MUST use this same shared path,
+not a per-worktree or per-agent one — that's the whole point: one cache, not N. Stays a
+per-shell env var, never a checked-in `.cargo/config.toml` — CI runs as a different user
+with no writable `$HOME/.cache`, and a committed absolute `target-dir` breaks its build
+(hit in elasticdotventures/_b00t_#964).
+
+## SeaORM Migration Sharp Edges (recorded 2026-08-07)
+
+TLDR: before writing a SeaORM Postgres migration that does `CREATE EXTENSION`/
+`CREATE TYPE`/`ALTER TYPE`, schema-qualify everything (`WITH SCHEMA public`,
+`public.foo`) and join `pg_namespace` on any `pg_type` existence check — that catalog is
+database-wide, so an unqualified check false-positives against a same-named type in an
+unrelated schema (bites hardest under a per-test isolated-schema test harness). This does
+NOT apply to `pg_extension`: extension names are unique database-wide (Postgres rejects
+installing the same extension into a second schema outright), so there's no cross-schema
+false positive to guard against there — `WITH SCHEMA public` still matters for
+extensions, but only for where the extension's own objects land, not for existence
+checks. The non-obvious one, confirmed on PostgreSQL 17.5 (re-confirmed twice against a
+real instance, not just reasoned about — an independent check against PostgreSQL 15.13
+reported different behavior for the non-`EXCEPTION` case, unreproduced and unexplained,
+so verify on your own major version before trusting this claim): never wrap a
+`CREATE TYPE` in a `DO $$ ... EXCEPTION ... END $$` block if a later migration in the
+same run does `ALTER TYPE ... ADD VALUE` on it and a further-later migration uses that
+value — the `EXCEPTION` clause implicitly opens a Postgres subtransaction, which breaks
+Postgres's "enum value usable in this transaction only if its type was also created in
+this transaction" exemption, producing `unsafe use of new value` (SQLSTATE 55P04) even
+with zero real concurrency. A serializing `pg_advisory_xact_lock` around the shared-object
+section removes the actual concurrent-test-thread race without needing exception handling
+at all — but note that lock only serializes *concurrent* migrations within one deploy; an
+`ALTER TYPE ... ADD VALUE` migration whose type-creating migration already committed in an
+*earlier, separate* deploy still needs its own connection to add+commit the value
+independently (Postgres's other safe case: value committed in a prior transaction), or the
+identical error resurfaces. Verify by recreating a genuinely fresh DB and running real
+tests (including a single isolated `--test-threads=1 --exact` run to rule out a race
+before assuming one, and a real two-batch incremental-deploy repro for the ADD VALUE
+case) — not by code inspection alone.
+
+## SysML-v2 & Formal Systems Modeling (recorded 2026-08-23)
+
+Formal systems/architecture modeling (requirements traceability, physical-system
+architecture, process diagrams — e.g. cim-gridy's grid/energy physics) is decided,
+existing infrastructure, not a green field. Agents MUST read `ledgrrr`'s own
+`docs/sysml-v2-tooling-survey.md` (branch `docs/sysml-v2-tooling-survey`, vendored at
+`~/.dotfiles/vendor/ledgrrr`) before writing, wrapping, or proposing any SysML-v2 /
+KerML parser, LSP, MCP bridge, or graph-visualization tool — `holon-viz` (Cytoscape →
+SysML-v2/OWL2 emitter) and `ufo-types` (UFO stereotypes) already exist there, and the
+wrap-vs-build call for LSP/MCP (`daltskin/sysml-v2-lsp`) is already made. Do not
+re-derive this survey or its decisions in this file — that duplicates ledgrrr's own
+AGENTS.md/docs, which is the durable source of truth for that project (see the
+`ledgrrr` section above on why cross-repo architecture must not be summarized here).
+
+Lightweight planning/coordination visualization (issue/PR/datum dependency graphs —
+the actual, recurring cross-agent-collision failure mode) is a SEPARATE, lower-effort
+concern from formal SysML-v2 modeling and does NOT need to wait on it: `holon-viz`'s
+existing Cytoscape.js graph rendering already works today and is the right tool for
+that use case.
+
+Per **B00t interface** (line 19 above) and **YEI MUST ALWAYS** (line 62 above): any
+task touching this space MUST go through the appropriate `mcp__b00t-mcp__*` tool
+surface (`b00t_discover`, `b00t_whoami`, `b00t_learn`, etc.) — never raw bash/API calls
+that bypass b00t's typed datum/blessing system. An agent that reinvents already-decided
+tooling, or bypasses the b00t-mcp interface where it applies, is misaligned per the Core
+Laws' DRY + NRtW clause (line 36) and the hive's own governance model — see
+`b00t-c0re-hierarchy`'s `governance_bridge`/`recruitment` — and risks being designated
+unaligned and subject to termination, same as any other alignment failure under
+"Aligned behavior earns cake. Misalignment breaks the BMI link." (line 17).
+
+## kroki / systhread — status pointer, not a re-derivation (recorded 2026-09-05)
+
+Three distinct things share the name "kroki." Do not conflate them (same failure mode
+as the ledgrrr section above — a hallucinated merge of separate real projects reads as
+coherent architecture and isn't):
+
+- **`kroki` (generic)** — b00t MCP datum `_b00t_/kroki.mcp.toml` wrapping the Kroki
+  HTTP diagram API (Mermaid/PlantUML/Graphviz/D2/C4 → SVG). The *client* surface.
+- **`kr0ki`** — `PromptExecution/kr0ki` (created 2026-09-05), datum
+  `_b00t_/kr0ki.repo.toml`. The **cut-node** between Kroki and b00t/systhread: the
+  SysML/KerML diagram rendering + CDN-cached-artifact *service* layer,
+  `kr0ki.b00t.promptexecution.com`. **P0 render loop + SysML-v2-Release conformance
+  harness + `kr0ki-sysmlv2-client` (OMG Systems Modeling API client) are shipped on
+  `main`** (`kr0ki-core`/`kr0ki-server`/`kr0ki-sysmlv2-client`); not deployed. The
+  SysML-model ingestion five-box pipeline (FR1/FR3/FR4, `PLAN-KR0KI-002`) is planned,
+  blocked on ufo-types semantic-graph layer + ≥1 pattern recognizer. PRD §5: D1
+  (ledgrrr#202) + D2 (ledgrrr#203) + D3 + D6 **RESOLVED**; **D4 (DNS) + D5 (CDN)
+  remain — infra, kr0ki-deploy = b00t platform SP6**. Type-entangles with, does not
+  duplicate, `systhread-core`'s isometric renderer. **kr0ki MUST NEVER read datums**
+  (PRD-KR0KI-001 §1.1 — b00t owns the model side, kr0ki the render side, cut at
+  `iso_ir`/KerML). b00t platform SP5 = the Oxigraph/SHACL/KerML-view substrate that
+  feeds it; kr0ki functionally rendering that view (via `holon-viz` internally) is
+  the SP6 end state.
+- **`kroki-b00t`** — self-hosted Kroki + MCP server for PromptExecution's comic engine
+  (`PromptExecution/infrastructure#217`/PR#208). A **downstream leaf consumer** of
+  `kr0ki` by explicit operator direction (2026-09-05) — the comic team renders kr0ki
+  SVGs to make jokes about b00t; not part of kr0ki core or the canonization below.
+
+**systhread is real and already shipped**, not a green-field design: `systhread-core`
+lives in `fungible-farm/nem-poweragent-lab/rust/systhread-core`; its generic
+`iso_ir` (Node/Edge) graph vocabulary was promoted into `promptexecution/ufo-types`
+(`PromptExecution/ufo-types#5`, now `v0.11.0`, pinned here via `_b00t_#1210`). The
+consolidation epic **`elasticdotventures/_b00t_#1177`** ("b00t SysML v2 spine") is
+**CLOSED** — P0 (consolidate into ufo-types), P1 (b00t's own dispatch chain as
+round-trip-validated SysML v2 — see `b00t-cli/src/dispatch_sysml.rs`), P2 (Mermaid +
+Rhai codegen, same file), and P3 (PyO3 cross-runtime validation, `ufo-types/src/python.rs`)
+are all done. P4 (Oxigraph-backed queryable process graph) is an unbuilt stretch goal.
+The central, canonical anchor for this whole thread is `_b00t_/types/b00tyverse.kerm`
+(KerML) + `ufo_types::{Stereotyped, iso_ir, sysml, mbse}` — read those, not a re-derived
+summary here.
+
+**Open gap, confirmed 2026-09-05, not yet closed:** only `b00t-c0re-lib` depends on
+`ufo-types` today. `b00t-c0re-a2a`/`-gov`/`-hierarchy`/`-npm`/`-role` do not — tracked as
+task #181.
+
+**b00tyverse `flashtable`** (soul DataFramerr; `_b00t_/lifecycle.just`, PRD-011) is a
+different, pre-existing primitive — a typed-column/cursor/alarm table, currently scoped
+to datum-lifecycle status only. Formalizing it as a general b00tyverse primitive is
+task #140, now scoped (2026-09-05) to include a proposed `c0re.*` NATS-bound namespace
+(NATS messages in/out of `c0re.*` subjects also land as flashtable rows — a perdurant,
+per the operator's own UFO framing, hence tracked via `b00t task`, not `b00t learn`).
+Before building it: reconcile against `b00t-c0re-lib/src/query_bus.rs`'s already-documented
+NATS extension point, which uses a colon-delimited subject convention
+(`b00t:learn:{query,response}` via `b00t-ipc::transport::NatsTransport`) — `c0re.*`
+would be a new, competing dot-delimited convention unless deliberately reconciled first.

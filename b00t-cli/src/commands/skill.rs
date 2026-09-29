@@ -28,6 +28,14 @@ pub enum SkillCommands {
         json: bool,
     },
 
+    #[clap(
+        about = "List installed Claude Code plugins and the skills they contribute (harmonization report)"
+    )]
+    Plugins {
+        #[clap(long, help = "Output JSON")]
+        json: bool,
+    },
+
     #[clap(about = "Search skills by query (name, description, tags)")]
     Search {
         #[clap(help = "Search query")]
@@ -52,6 +60,11 @@ pub enum SkillCommands {
         name: String,
         #[clap(long, help = "Prefix with role context from named role datum")]
         role: Option<String>,
+        #[clap(
+            long,
+            help = "#1106: run the sm0l relevance-gate reviewer before emitting the skill body, judged against this goal. Opt-in; fails open (emits the skill anyway) with a warning if the reviewer backend is unreachable."
+        )]
+        gate: Option<String>,
     },
 
     #[clap(about = "Serve skills via HTTP for remote loading by opencode")]
@@ -145,6 +158,8 @@ pub fn handle_skill_command(cmd: &SkillCommands, path: &str) -> Result<()> {
             Ok(())
         }
 
+        SkillCommands::Plugins { json } => handle_plugins(*json),
+
         SkillCommands::Search { query, json } => {
             let metas = resolver.search(query);
 
@@ -203,8 +218,34 @@ pub fn handle_skill_command(cmd: &SkillCommands, path: &str) -> Result<()> {
             Ok(())
         }
 
-        SkillCommands::Activate { name, role } => {
+        SkillCommands::Activate { name, role, gate } => {
             let content = resolver.load(name)?;
+
+            // #1106: opt-in relevance gate — the karpathy/deepwiki 3-gate
+            // autolearn pattern's Research gate, applied here for the
+            // first time. Fails open (still emits the skill, loudly
+            // warns) rather than silently no-op'ing or blocking, per the
+            // issue's explicit requirement.
+            if let Some(goal) = gate {
+                use b00t_c0re_lib::reviewer_gate::{GateMode, GateVerdict, gate_verdict};
+                let review_input = format!(
+                    "Skill: {}\nDescription: {}\n\n{}",
+                    content.meta.name, content.meta.description, content.instructions
+                );
+                match gate_verdict(&review_input, &GateMode::Relevance { goal: goal.clone() }) {
+                    GateVerdict::Block { reason } => {
+                        println!(
+                            "🚫 Skill '{}' skipped by relevance gate for goal '{}': {}",
+                            name, goal, reason
+                        );
+                        return Ok(());
+                    }
+                    GateVerdict::Unavailable { warning } => {
+                        eprintln!("⚠️  skill activate --gate: {warning}");
+                    }
+                    GateVerdict::Pass => {}
+                }
+            }
 
             // Optional role context prefix
             if let Some(role_name) = role {
@@ -231,6 +272,78 @@ pub fn handle_skill_command(cmd: &SkillCommands, path: &str) -> Result<()> {
             depth,
         } => handle_index(dirs, *json, *store, *depth),
     }
+}
+
+/// Count subdirectories containing a `SKILL.md` file (non-recursive).
+fn count_skill_md_dirs(dir: &std::path::Path) -> usize {
+    std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|e| e.path().join("SKILL.md").is_file())
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+/// `b00t skill plugins` — report installed Claude Code plugins (from
+/// `~/.claude/plugins/installed_plugins.json`) and how many skills each
+/// contributes to `b00t skill list`. Read-only: b00t doesn't install or
+/// manage these, only harmonizes their bundled skills into the resolver.
+fn handle_plugins(json: bool) -> Result<()> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot resolve home directory"))?;
+    let claude_dir = home.join(".claude");
+    let entries = crate::datum_claude_plugin::read_installed_plugins(&claude_dir);
+
+    if json {
+        let out: Vec<_> = entries
+            .iter()
+            .map(|(key, entry)| {
+                let skills_dir = PathBuf::from(&entry.install_path).join("skills");
+                let skill_count = if skills_dir.is_dir() {
+                    count_skill_md_dirs(&skills_dir)
+                } else {
+                    0
+                };
+                json!({
+                    "plugin": key,
+                    "version": entry.version,
+                    "scope": entry.scope,
+                    "install_path": entry.install_path,
+                    "skill_count": skill_count,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&out)?);
+    } else if entries.is_empty() {
+        println!(
+            "No Claude Code plugins found (checked {}).",
+            claude_dir
+                .join("plugins")
+                .join("installed_plugins.json")
+                .display()
+        );
+    } else {
+        for (key, entry) in &entries {
+            let skills_dir = PathBuf::from(&entry.install_path).join("skills");
+            let skill_count = if skills_dir.is_dir() {
+                count_skill_md_dirs(&skills_dir)
+            } else {
+                0
+            };
+            let skills_note = if skill_count > 0 {
+                format!(" — {} skill(s), see `b00t skill list`", skill_count)
+            } else {
+                String::new()
+            };
+            println!(
+                "• {} (v{}, scope: {}){}",
+                key, entry.version, entry.scope, skills_note
+            );
+        }
+        println!("\n{} plugin(s) installed", entries.len());
+    }
+    Ok(())
 }
 
 /// Build a `SkillResolver` relative to the provided CLI `path` argument.

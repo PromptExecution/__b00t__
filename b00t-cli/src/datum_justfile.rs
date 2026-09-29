@@ -21,9 +21,11 @@ pub struct JustfileDatum {
 
 impl JustfileDatum {
     pub fn from_config(name: &str, path: &str) -> Result<Self> {
-        let (config, _filename) = get_config(name, path).map_err(|e| anyhow!("{}", e))?;
+        let (config, filename) = get_config(name, path).map_err(|e| anyhow!("{}", e))?;
         let datum = config.b00t;
-        let justfile_path = Self::resolve_justfile_path(&datum, path)?;
+        // #1308: resolve symlinked datums against the real file's directory
+        let base = crate::datum_utils::resolve_datum_base_dir(path, &filename);
+        let justfile_path = Self::resolve_justfile_path(&datum, &base.display().to_string())?;
         Ok(JustfileDatum {
             datum,
             justfile_path,
@@ -302,12 +304,19 @@ impl CliExecutor for JustfileDatum {
                         .iter()
                         .map(|p| ParameterSignature {
                             name: p.name.clone(),
-                            default_value: p.default.clone(),
+                            // A literal default renders as its plain string;
+                            // a non-literal default (e.g. `image=SOME_VAR`)
+                            // comes back as a nested AST Value, not a bare
+                            // string — fall back to its JSON text rather
+                            // than losing the value.
+                            default_value: p.default.as_ref().map(|v| {
+                                v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string())
+                            }),
                             required: p.default.is_none() && p.kind == "singular",
                             kind: p.kind.clone(),
                         })
                         .collect(),
-                    dependencies: r.dependencies.clone(),
+                    dependencies: r.dependencies.iter().map(|d| d.name()).collect(),
                     private: r.private,
                 })
                 .collect()

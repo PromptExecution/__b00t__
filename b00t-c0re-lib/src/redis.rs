@@ -156,6 +156,19 @@ impl RedisComms {
             if let Some(hint) = sandbox_root_cause_hint("Redis TCP connectivity") {
                 message.push(' ');
                 message.push_str(&hint);
+            } else {
+                // Generic remediation for the common "Redis just isn't running
+                // locally" case (issue #83). Redis is optional for agent
+                // discovery — after that fix it's only needed for the live
+                // coordination paths (message/delegate/vote/etc).
+                message.push_str(
+                    " Redis does not appear to be reachable. If you need the \
+                    live agent-coordination features (message/delegate/vote), \
+                    start a local Redis, e.g.: \
+                    `podman run -d --name redis -p 6379:6379 redis:7-alpine`. \
+                    `b00t agent discover`/`agent capability`/`agent workers` work fine without \
+                    Redis — they fall back to local _b00t_/*.agent.toml.",
+                );
             }
             message
         })?;
@@ -375,6 +388,23 @@ impl RedisComms {
             .query(&mut conn)
             .context("Failed to set EXPIRE on key in Redis")?;
         Ok(result == 1)
+    }
+
+    /// Execute a Lua script with the given KEYS and ARGV, returning the raw
+    /// string result (caller parses further, e.g. as JSON). Uses a plain
+    /// `EVAL` command rather than `redis::Script` so no new crate feature
+    /// flag is needed -- matches this file's existing `redis::cmd(...)` style.
+    pub fn eval_script(&self, script: &str, keys: &[String], args: &[String]) -> B00tResult<String> {
+        let mut conn = self.get_connection()?;
+        let mut cmd = redis::cmd("EVAL");
+        cmd.arg(script).arg(keys.len());
+        for k in keys {
+            cmd.arg(k);
+        }
+        for a in args {
+            cmd.arg(a);
+        }
+        cmd.query(&mut conn).context("Failed to EVAL script on Redis")
     }
 
     /// Get hash field
@@ -685,6 +715,24 @@ mod tests {
         let storage = RedisSessionStorage::new(config, Some("test".to_string())).unwrap();
         let key = storage.session_key("session123", "counter");
         assert_eq!(key, "test:session123:counter");
+    }
+
+    #[test]
+    fn test_eval_script_echoes_keys_and_args() {
+        let config = RedisConfig::default();
+        let comms = RedisComms::new(config, "test-agent".to_string()).unwrap();
+        if !comms.is_available() {
+            eprintln!("skipping: no Redis reachable in this environment");
+            return;
+        }
+        let result = comms
+            .eval_script(
+                "return KEYS[1] .. ':' .. ARGV[1]",
+                &["k1".to_string()],
+                &["a1".to_string()],
+            )
+            .unwrap();
+        assert_eq!(result, "k1:a1");
     }
 
     // Integration tests require Redis server running

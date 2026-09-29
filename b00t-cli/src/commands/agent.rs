@@ -431,7 +431,17 @@ async fn handle_workers(json: bool) -> Result<()> {
     };
 
     let coordinator = AgentCoordinator::new(redis, metadata);
-    let mut agents = coordinator.discover_agents().await?;
+    // Kaizen: same Redis-connection-error fallback as handle_discover()/
+    // handle_capability() (issue #83) — `agent workers` hit the identical
+    // bare-`?` bug, bailing before the local `_b00t_/*.agent.toml` fallback
+    // below ever ran.
+    let mut agents = match coordinator.discover_agents().await {
+        Ok(agents) => agents,
+        Err(e) => {
+            eprintln!("⚠️  Redis unavailable ({e}); using local _b00t_/*.agent.toml");
+            Vec::new()
+        }
+    };
 
     // Kaizen: Redis empty → surface locally-defined agents.
     if agents.is_empty() {
@@ -569,7 +579,16 @@ async fn handle_discover(
     };
 
     let coordinator = AgentCoordinator::new(redis, metadata);
-    let mut agents = coordinator.discover_agents().await?;
+    // Kaizen: a Redis connection failure (broker down/unreachable) must fall
+    // back the same as an empty-but-successful response — otherwise `?` bails
+    // out before the local `_b00t_/*.agent.toml` fallback below ever runs.
+    let mut agents = match coordinator.discover_agents().await {
+        Ok(agents) => agents,
+        Err(e) => {
+            eprintln!("⚠️  Redis unavailable ({e}); using local _b00t_/*.agent.toml");
+            Vec::new()
+        }
+    };
     let from_redis = !agents.is_empty();
 
     // Kaizen: Redis registry empty/unavailable → fall back to locally-defined
@@ -631,10 +650,11 @@ async fn handle_discover(
 
 async fn handle_message(to_agent: &str, subject: &str, content: &str, ack: bool) -> Result<()> {
     let config = RedisConfig::default();
-    let redis = RedisComms::new(config, "cli-message".into())?;
+    let agent_id = cli_agent_id();
+    let redis = RedisComms::new(config, agent_id.clone())?;
 
     let metadata = AgentMetadata {
-        agent_id: "cli-sender".to_string(),
+        agent_id,
         agent_role: "cli".to_string(),
         capabilities: vec![],
         crew: None,
@@ -988,9 +1008,18 @@ async fn handle_capability(capabilities: &str, description: &str, urgency_str: &
     println!("Requesting agents with capabilities: {}", capabilities);
     println!("Task: {}", description);
 
-    let agents = coordinator
+    // Kaizen: a Redis connection failure must fall back the same as an
+    // empty-but-successful response — see handle_discover() above.
+    let agents = match coordinator
         .request_capability(required_caps.clone(), description, urgency)
-        .await?;
+        .await
+    {
+        Ok(agents) => agents,
+        Err(e) => {
+            eprintln!("⚠️  Redis unavailable ({e}); using local _b00t_/*.agent.toml");
+            Vec::new()
+        }
+    };
 
     if agents.is_empty() {
         // Kaizen: Redis unavailable → fall back to locally-defined agents.
@@ -1066,10 +1095,11 @@ async fn handle_wait(
     subject: Option<String>,
 ) -> Result<()> {
     let config = RedisConfig::default();
-    let redis = RedisComms::new(config, "cli-wait".into())?;
+    let agent_id = cli_agent_id();
+    let redis = RedisComms::new(config, agent_id.clone())?;
 
     let metadata = AgentMetadata {
-        agent_id: "cli-wait".to_string(),
+        agent_id,
         agent_role: "cli".to_string(),
         capabilities: vec![],
         crew: None,
@@ -1080,7 +1110,7 @@ async fn handle_wait(
         subtype: Default::default(),
     };
 
-    let coordinator = AgentCoordinator::new(redis, metadata);
+    let mut coordinator = AgentCoordinator::new(redis, metadata);
 
     let filter = MessageFilter {
         message_types: message_type.map(|t| vec![t]),
@@ -1103,6 +1133,18 @@ async fn handle_wait(
     }
 
     Ok(())
+}
+
+/// Resolve the identity used by CLI notification consumers and senders.
+///
+/// The transport subject is keyed by this value, so synthetic identities such
+/// as `cli-wait` silently disconnect a harness from the agent it is running on.
+fn cli_agent_id() -> String {
+    std::env::var("B00T_AGENT_ID")
+        .or_else(|_| std::env::var("_B00T_Agent"))
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .or_else(|_| std::env::var("USER"))
+        .unwrap_or_else(|_| "agent/local".to_string())
 }
 
 async fn handle_start(config_path: &PathBuf) -> Result<()> {

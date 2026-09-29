@@ -11,15 +11,33 @@ use b00t_c0re_a2a::agent_card::{AgentCard, Skill};
 use b00t_c0re_a2a::agent_store::AgentStore;
 use b00t_c0re_hierarchy::recruitment::*;
 use b00t_c0re_hierarchy::roles::*;
+use b00t_c0re_role::KnownRole;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
+use crate::cake_ledger::CakeLedger;
 use crate::commands::crew::CrewCommand;
+
+/// Real, ledger-backed cake balance for `agent`, falling back to the
+/// static `CrewMeta` placeholder value only if the ledger can't be opened
+/// (e.g. no writable `$HOME` in a constrained environment) or has no
+/// record for this agent yet.
+fn live_cake_balance(ledger: Option<&CakeLedger>, agent: &Agent) -> i64 {
+    let Some(ledger) = ledger else {
+        return agent.cake_balance as i64;
+    };
+    match ledger.has_record(&agent.id) {
+        Ok(true) => ledger
+            .balance(&agent.id)
+            .unwrap_or(agent.cake_balance as i64),
+        _ => agent.cake_balance as i64,
+    }
+}
 
 /// Metadata for crew-specific fields not present in AgentCard.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CrewMeta {
-    role: Role,
+    role: KnownRole,
     manager_id: Option<String>,
     cake_balance: f64,
     is_alive: bool,
@@ -29,7 +47,7 @@ struct CrewMeta {
 impl Default for CrewMeta {
     fn default() -> Self {
         Self {
-            role: Role::Executor,
+            role: KnownRole::worker(),
             manager_id: None,
             cake_balance: 100.0,
             is_alive: true,
@@ -134,7 +152,7 @@ fn seed_if_empty(store: &AgentStore) {
             serde_json::json!({}),
         ));
     let rc_meta = CrewMeta {
-        role: Role::Executor,
+        role: KnownRole::worker(),
         manager_id: None,
         cake_balance: 100.0,
         is_alive: true,
@@ -165,7 +183,7 @@ fn seed_if_empty(store: &AgentStore) {
             serde_json::json!({}),
         ));
     let de_meta = CrewMeta {
-        role: Role::Executor,
+        role: KnownRole::worker(),
         manager_id: None,
         cake_balance: 150.0,
         is_alive: true,
@@ -196,7 +214,7 @@ fn seed_if_empty(store: &AgentStore) {
             serde_json::json!({}),
         ));
     let db_meta = CrewMeta {
-        role: Role::Executor,
+        role: KnownRole::worker(),
         manager_id: None,
         cake_balance: 80.0,
         is_alive: true,
@@ -255,6 +273,19 @@ fn update_meta(store: &AgentStore, name: &str, f: impl FnOnce(&mut CrewMeta)) {
     save_meta(&mp, &meta);
 }
 
+/// Look up whether `agent_id` is recorded as a human player in the crew
+/// roster (`Agent::is_player`, via `_crew_meta.json`). Returns `false` for
+/// unknown agent ids — i.e. "assume software agent" absent other evidence.
+/// Used by `b00t-mcp` to tag outgoing messages/votes with sender identity.
+pub fn is_player(agent_id: &str) -> bool {
+    let store = AgentStore::with_path(default_store_dir());
+    all_agents(&store)
+        .into_iter()
+        .find(|a| a.id == agent_id)
+        .map(|a| a.is_player)
+        .unwrap_or(false)
+}
+
 // ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
@@ -299,22 +330,25 @@ fn handle_recruit(store: &AgentStore, skills: &str, limit: usize) {
         "Top candidates (operator fee: {}%):",
         (response.operator_fee_pct * 100.0) as u32
     );
+    let ledger = CakeLedger::open().ok();
     for (i, agent) in response.candidates.iter().enumerate() {
         println!(
-            "  {}. {} — skills: {:?}, cake: {:.1}",
+            "  {}. {} — skills: {:?}, cake: {}",
             i + 1,
             agent.id,
             agent.skills,
-            agent.cake_balance
+            live_cake_balance(ledger.as_ref(), agent)
         );
     }
 }
 
 fn handle_hire(store: &AgentStore, agent_id: &str, role: Option<&str>) {
     let target_role = match role {
-        Some("executor") => Role::Executor,
-        Some("specialist") => Role::Specialist,
-        _ => Role::Executor,
+        // "executor" is a deliberate CLI-input backward-compat alias for the old
+        // b00t-c0re-hierarchy::Role::Executor, now KnownRole::worker() -- keep it.
+        Some("worker") | Some("executor") => KnownRole::worker(),
+        Some("specialist") => KnownRole::specialist(),
+        _ => KnownRole::worker(),
     };
 
     // Update the agent's role and manager in the metadata
@@ -323,49 +357,53 @@ fn handle_hire(store: &AgentStore, agent_id: &str, role: Option<&str>) {
         meta.manager_id = Some("captain".to_string());
     });
 
-    println!("Hired {} as {:?}", agent_id, target_role);
+    println!("Hired {} as {}", agent_id, target_role);
 }
 
 fn handle_roster(store: &AgentStore) {
     let agents = all_agents(store);
     println!("Current roster ({} agents):", agents.len());
+    let ledger = CakeLedger::open().ok();
 
     // Separate by role
-    let mut captains = Vec::new();
-    let mut executors = Vec::new();
+    let mut executives = Vec::new();
+    let mut workers = Vec::new();
     let mut operators = Vec::new();
     let mut specialists = Vec::new();
-    let mut bouncers = Vec::new();
 
     for agent in &agents {
-        match agent.role {
-            Role::Captain => captains.push(agent),
-            Role::Executor => executors.push(agent),
-            Role::Operator => operators.push(agent),
-            Role::Specialist => specialists.push(agent),
-            Role::Bouncer => bouncers.push(agent),
-            Role::Mate | Role::Player => specialists.push(agent),
+        match &agent.role {
+            KnownRole::Executive(_) => executives.push(agent),
+            KnownRole::Worker(_) => workers.push(agent),
+            KnownRole::Operator(_) => operators.push(agent),
+            KnownRole::Specialist(_) => specialists.push(agent),
         }
     }
 
-    println!("  Captain:");
-    if captains.is_empty() {
+    println!("  Executive:");
+    if executives.is_empty() {
         println!("    you");
     } else {
-        for a in &captains {
-            println!("    {} (cake: {:.1})", a.id, a.cake_balance);
+        for a in &executives {
+            println!(
+                "    {} (cake: {})",
+                a.id,
+                live_cake_balance(ledger.as_ref(), a)
+            );
         }
     }
 
-    println!("  Executors:");
-    if executors.is_empty() {
+    println!("  Workers:");
+    if workers.is_empty() {
         println!("    (none)");
     } else {
-        for a in &executors {
+        for a in &workers {
             let mgr = a.manager_id.as_deref().unwrap_or("none");
             println!(
-                "    {} (manager: {}, cake: {:.1})",
-                a.id, mgr, a.cake_balance
+                "    {} (manager: {}, cake: {})",
+                a.id,
+                mgr,
+                live_cake_balance(ledger.as_ref(), a)
             );
         }
     }
@@ -377,21 +415,10 @@ fn handle_roster(store: &AgentStore) {
         for a in &operators {
             let mgr = a.manager_id.as_deref().unwrap_or("none");
             println!(
-                "    {} (manager: {}, cake: {:.1})",
-                a.id, mgr, a.cake_balance
-            );
-        }
-    }
-
-    println!("  Bouncers:");
-    if bouncers.is_empty() {
-        println!("    (none)");
-    } else {
-        for a in &bouncers {
-            let mgr = a.manager_id.as_deref().unwrap_or("none");
-            println!(
-                "    {} (manager: {}, cake: {:.1})",
-                a.id, mgr, a.cake_balance
+                "    {} (manager: {}, cake: {})",
+                a.id,
+                mgr,
+                live_cake_balance(ledger.as_ref(), a)
             );
         }
     }
@@ -403,8 +430,10 @@ fn handle_roster(store: &AgentStore) {
         for a in &specialists {
             let mgr = a.manager_id.as_deref().unwrap_or("none");
             println!(
-                "    {} (manager: {}, cake: {:.1})",
-                a.id, mgr, a.cake_balance
+                "    {} (manager: {}, cake: {})",
+                a.id,
+                mgr,
+                live_cake_balance(ledger.as_ref(), a)
             );
         }
     }

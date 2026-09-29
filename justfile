@@ -18,12 +18,16 @@ mod? irontology-publish 'vendor/irontology-mcp/irontology-publish.just'
 mod? irontology 'vendor/irontology-mcp/irontology.just'
 # 🥾 Zellij interactive modal system (floating pane dialogs)
 mod zellij '_b00t_/zellij.just'
+# 🖥️  General-purpose always-on Xpra display service (task #12) — NOT owned
+#    by b00t-rpa; see _b00t_/xpra-display.hive.toml
+mod xpra-display '_b00t_/xpra-display.just'
 # 🛡️ Zellij mandatory interaction gate (governance: Allow/Deny/Hook)
 mod zellij-gate '_b00t_/zellij-gate.just'
 # 🌐 b00t-admin web server — dashboard, container, quadlet
 mod b00t-admin 'vendor/b00t-admin/b00t-admin.just'
 # 📚 Rust documentation MCP server — required by skills/rust
 mod rust-doc 'vendor/rust-doc.just'
+mod gh-runner-gpu 'k8s/gh-runner-gpu/gh-runner-gpu.just'
 # 🥾 Compound engineering workflow — 8-phase agile state machine
 mod compound-engineering '_b00t_/compound-engineering.just'
 # 🛡️ Canonical reviewer skill — MECE+TRIZ+Eureka multi-framework review
@@ -46,7 +50,10 @@ mod ngc '_b00t_/ngc.just'
 mod ux 'ux.just'
 mod hf-cloud '_b00t_/justfile-hf-cloud.just'
 mod gemma '_b00t_/justfile-gemma.just'
+mod phi-candle '_b00t_/phi-candle.just'
 mod worker '_b00t_/justfile-worker.just'
+# ☁️ Cloudflare Workers — secret provisioning + deploy (b00t-mcp-vault, telnyx-fax-handler, ledgrrr-tenant-registry, ...)
+mod cf-workers 'workers/cf-workers.just'
 mod review '_b00t_/justfile-review.just'
 mod ufo '_b00t_/justfile-ufo.just'
 mod chore '_b00t_/justfile-chore.just'
@@ -56,6 +63,9 @@ mod h3rmes '_b00t_/justfile-h3rmes.just'
 mod b00t-embed '_b00t_/justfile-b00t-embed.just'
 mod autolearn '_b00t_/justfile-autolearn.just'
 mod ralph '_b00t_/justfile-ralph.just'
+mod dstack-sdd '_b00t_/justfile-dstack-sdd.just'
+# 🥧 pi coding agent ⇄ b00t-mcp integration (canonical command surface for pi.agent datum)
+mod pi-agent '_b00t_/pi-agent.just'
 
 # ── Module guide — `just modules` or `just --list <module>` ──────────────────
 # Lists all submodule justfiles registered in this repo.
@@ -75,6 +85,7 @@ mod ralph '_b00t_/justfile-ralph.just'
     @echo "  b00t          Core b00t CLI wrappers"
     @echo "  embed         Embedding pipeline"
     @echo "  qwen-code     Qwen code agent"
+    @echo "  pi-agent      pi coding agent ⇄ b00t-mcp (just pi-agent::install|check|probe)"
     @echo "  irontology    Ontology + semantic RAG"
     @echo ""
     @echo "  Usage: just <module>::<recipe>"
@@ -116,6 +127,43 @@ gremlin-graalvm-run:
 
 stow:
     stow --adopt -d ~/.dotfiles -t ~ bash
+
+# Sync canonical _b00t_/ datum tree -> the live deployed _B00T_Path
+# (default ~/.dotfiles/_b00t_, resolved via _B00T_Path env if set).
+# Additive-only (no --delete): only adds/updates files from canonical,
+# never removes dotfiles-local files that don't exist here.
+# Default is a dry-run (rsync -n); pass `true` (positional — just recipe
+# args are positional, `apply=true` on the CLI is NOT recognized and will
+# silently stay in dry-run) to actually write.
+#
+# 🤓 bug/#13: ~/.dotfiles/_b00t_ (the live b00t-cli default _B00T_Path) drifts
+#    from this repo's canonical _b00t_/ tree with no sync mechanism — e.g.
+#    missing sonar.cli.toml causes 'b00t cli install sonar' to fail
+#    'sonar UNDEFINED' even though the datum exists here. This recipe is
+#    the documented refresh step; run it whenever a datum you just added
+#    here doesn't seem to exist for the live b00t-cli.
+#    ~/.dotfiles is a separate git repo (its own history) — this only
+#    overwrites its _b00t_/ subtree, never deletes, and the operator should
+#    `git stash` any uncommitted ~/.dotfiles changes first since rsync will
+#    silently clobber/resurrect files that differ from canonical.
+#
+# @example: just sync-g0spell-dotfiles          # dry-run, shows the drift
+# @example: just sync-g0spell-dotfiles true     # apply (positional, not apply=true)
+sync-g0spell-dotfiles apply="false" target=env_var_or_default("_B00T_Path", "~/.dotfiles/_b00t_"):
+    #!/bin/bash
+    set -euo pipefail
+    SRC="{{repo-root}}/_b00t_/"
+    DST="{{target}}"
+    DST="${DST/#\~/$HOME}"
+    echo "🔄 g0spell sync: $SRC -> $DST"
+    if [[ "{{apply}}" != "true" ]]; then
+        echo "(dry-run — pass 'true' as the first arg to write, e.g. 'just sync-g0spell-dotfiles true'; this never deletes dotfiles-local files)"
+        rsync -avn --exclude='.git' "$SRC" "$DST"
+    else
+        mkdir -p "$DST"
+        rsync -av --exclude='.git' "$SRC" "$DST"
+        echo "✅ synced. cd $DST/.. && git status to review + commit the drift."
+    fi
 
 ansible-k0s PLAYBOOK="ansible/playbooks/k0s_kata.yaml" INVENTORY="ansible/inventory.sample.yaml" EXTRA_ARGS="":
     #!/bin/bash
@@ -538,6 +586,22 @@ ra_run:
 test:
     cargo test -- --nocapture
 
+# Verify the compact b00t-mcp surface and communication output contract.
+test-b00t-mcp:
+    cargo test -p b00t-mcp
+
+# Salvage-first lfmf writer regression tests -- zero duplication, zero payload loss (issue #934, ports #1183's coverage onto #1163's shipped fix).
+test-lfmf-roundtrip:
+    cargo test -p b00t-cli --test lfmf_salvage_test --test lfmf_writer_test
+
+# Format the b00t-mcp crate through the registered action surface.
+format-b00t-mcp:
+    rustfmt --edition 2024 b00t-mcp/src/chat.rs b00t-mcp/src/mcp_server_rusty.rs b00t-mcp/src/mcp_tools.rs
+
+# Install the already-versioned b00t-mcp after its focused contract passes.
+install-b00t-mcp: test-b00t-mcp
+    cargo install --locked --path b00t-mcp --force
+
 # 🤓 deterministic hive accelerator/soul verification (P1–P3).
 #    Builds the test binary ONCE (--no-run), then runs hive tests directly —
 #    avoids re-linking the full workspace test binary on every invocation.
@@ -615,6 +679,17 @@ version:
 commit-hook:
     #!/bin/bash
     set -euo pipefail
+    # Block direct commits to main — always work on a branch + PR (task #211).
+    CURRENT_BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+    if [[ "${CURRENT_BRANCH}" == "main" ]]; then
+        if [[ -f ".b00t/allow-main-commit" ]]; then
+            echo "⚠️  Committing directly to main (allow-main-commit present) — confirm intentional."
+        else
+            echo "❌ Direct commits to main are blocked. Create a branch: git checkout -b <name>"
+            echo "   To bypass once: touch .b00t/allow-main-commit (not recommended, remove after)"
+            exit 1
+        fi
+    fi
     # If strict-review flag exists, run the blocking reviewer gate
     if [[ -f ".b00t/strict-review" ]]; then
         echo "🛡️  strict-review gate active — validating staged changes..."
@@ -966,6 +1041,11 @@ ask query="":
 # ── ufo-types crate (#511) — Tax-Lawyer UFO stereotypes + Satisfies<T> ──────
 # (moved to mod ufo '_b00t_/justfile-ufo.just')
 
+# Regenerate the ufo-types adoption baseline report (issue #928) — measures
+# real adoption via grep, not hand-maintained numbers that silently drift.
+ufo-adoption-report:
+    @bash _b00t_/scripts/ufo-adoption-report.sh
+
 # ── Chore memoization — recipes for fine-tune corpus (fewer tokens) ─────────
 # (moved to mod chore '_b00t_/justfile-chore.just')
 
@@ -998,8 +1078,15 @@ android-sandbox:
 b00t-test-harness:
     @bash _b00t_/scripts/b00t-ping-pong.sh
 
+# Pre-cargo gate: detect submodule pin drift (recorded gitlink vs checked-out HEAD).
+# Distinguishes drifted+clean (safe, auto-fixable) from drifted+dirty (report only).
+# Usage: just doctor         (report only)
+#        just doctor --fix   (auto-sync drifted+clean submodules; never touches dirty ones)
+doctor *ARGS:
+    @bash _b00t_/scripts/check-submodule-drift.sh {{ARGS}}
+
 # Fast compile-check (no tests) — use BEFORE cargo test to catch wiring errors cheaply
-check-fast:
+check-fast: doctor
     cargo check --package b00t-cli --message-format=short 2>&1 | grep -E "^error" | head -20 || echo "✅ check clean"
 
 # ── ch0nky slot swap (pi ↔ opencode) ─────────────────────────────────────────
@@ -1064,7 +1151,562 @@ skill-wrkflw-list:
 #   - Namespaced: `just ledgrrr viz` not `just ledgrrr-viz`
 #   - Vendor owns its own lifecycle; root only adds `mod` line
 # See vendor/ledgrrr/ledgrrr.just header for full documentation.
+# ─────────────────────────────────────────────────────────────────────────────
+# ── ralph with diversity ──────────────────────────────────────────────────────
+# ralph-spawn: instantiate a ralph agent with a random personality + transferable skills.
+# Karpathy deepwiki OKR pattern: RESEARCH is a separate cycle from EXECUTION.
+# Each spawn gets: (a) random personality archetype, (b) random 2-3 transferable skills.
+# Different skills → different heuristics → better collective hive diversity.
+# 🤓 Never assign the same transferable skills to every agent — entropy is a feature.
 
+# List of transferable skills (from _b00t_/*.skill.toml type_tags=["transferable"])
+_TRANSFERABLE_SKILLS := "kaizen triz six-sigma ideo mece first-principles socratic bayesian rubber-duck pre-mortem five-whys ockham"
 
+# Personality archetypes — injected as system bias, not hard constraints
+_PERSONALITIES := "methodical-skeptic creative-synthesizer devil-advocate systems-thinker pragmatic-fixer pattern-hunter first-principles-zealot bayesian-updater"
 
+# Spawn one ralph: random personality + N random transferable skills, run GOAL
+ralph-spawn goal="" n_skills="3" tool="claude-code":
+    #!/usr/bin/env bash
+    set -euo pipefail
 
+    # ── Sample random personality ─────────────────────────────────────────────
+    PERSONALITIES=({{_PERSONALITIES}})
+    PERSONALITY="${PERSONALITIES[$RANDOM % ${#PERSONALITIES[@]}]}"
+    echo "[ralph:spawn] personality=$PERSONALITY"
+
+    # ── Sample N random transferable skills (no repeats) ─────────────────────
+    ALL_SKILLS=({{_TRANSFERABLE_SKILLS}})
+    SHUFFLED=($(printf '%s\n' "${ALL_SKILLS[@]}" | shuf))
+    ASSIGNED=("${SHUFFLED[@]:0:{{n_skills}}}")
+    echo "[ralph:spawn] transferable skills: ${ASSIGNED[*]}"
+
+    # ── Load blessing content for each assigned skill ─────────────────────────
+    SKILL_CONTENT=""
+    for SKILL in "${ASSIGNED[@]}"; do
+      CONTENT=$(b00t-cli learn "$SKILL" --concise 2>/dev/null || true)
+      if [ -n "$CONTENT" ]; then
+        SKILL_CONTENT=$(printf '%s\n## %s\n%s\n' "$SKILL_CONTENT" "$SKILL" "$CONTENT")
+      fi
+    done
+
+    # ── Karpathy OKR: RESEARCH phase (separate from execution) ───────────────
+    # Research soul is pre-loaded before task starts — not inline during execution.
+    # This is NOT generic RAG. It is: goal → OKR decomposition → targeted topic research.
+    GOAL_TEXT="{{goal}}"
+    if [ -z "$GOAL_TEXT" ]; then
+      GOAL_TEXT=$(b00t-cli task next --json 2>/dev/null | jq -r '.title // empty' || true)
+    fi
+    if [ -z "$GOAL_TEXT" ]; then echo "[ralph] no goal"; exit 1; fi
+
+    echo "[ralph:okr] decomposing goal: $GOAL_TEXT"
+    OKR_TOPICS=$(echo "$GOAL_TEXT" | tr '[:upper:]' '[:lower:]' \
+      | tr -cs 'a-z0-9-' '\n' | awk 'length>3' | sort -u | head -5)
+
+    echo "[ralph:research] soul topics: $(echo "$OKR_TOPICS" | tr '\n' ' ')"
+    while IFS= read -r TOPIC; do
+      [ -z "$TOPIC" ] && continue
+      SOUL=$(b00t-cli learn "$TOPIC" --concise 2>/dev/null | head -20 || true)
+      [ -n "$SOUL" ] && echo "[soul:$TOPIC] loaded ($(echo "$SOUL" | wc -c)c)"
+    done <<< "$OKR_TOPICS"
+
+    # ── Compile agent context packet ────────────────────────────────────────────
+    TOPICS_STR=$(echo "$OKR_TOPICS" | tr '\n' ' ')
+    CTX_FILE=$(mktemp /tmp/ralph-ctx-XXXXXX.md)
+    {
+      echo "## Ralph Agent Instantiation"
+      echo "personality: $PERSONALITY"
+      echo "transferable_skills: ${ASSIGNED[*]}"
+      echo "goal: $GOAL_TEXT"
+      echo "research_topics: $TOPICS_STR"
+      echo ""
+      echo "## Transferable Skills (active this session)"
+      echo "$SKILL_CONTENT"
+      echo ""
+      echo "## Operating Protocol"
+      echo "RESEARCH phase is COMPLETE. Do NOT re-research inline during execution."
+      echo "Apply personality ($PERSONALITY) as a cognitive lens, not a hard constraint."
+      echo "Transferable skills are heuristics: apply when they clarify."
+      echo "Report sharp corners: b00t lfmf <topic> <lesson>"
+      echo "Log progress: b00t task update <id> --status done"
+    } > "$CTX_FILE"
+    AGENT_CTX=$(cat "$CTX_FILE")
+    rm -f "$CTX_FILE"
+
+    echo "[ralph:ready] agent context: $(echo "$AGENT_CTX" | wc -c)c"
+    echo "$AGENT_CTX"
+
+# ralph-diverse-hive: spawn N ralph agents with independent personalities/skills for same goal
+ralph-diverse-hive goal="" n_agents="3" n_skills="3":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "[hive:diverse] spawning {{n_agents}} ralph agents for: {{goal}}"
+    for i in $(seq 1 {{n_agents}}); do
+      echo "── agent $i/$(({{n_agents}})) ──"
+      just ralph-spawn "{{goal}}" "{{n_skills}}" &
+    done
+    wait
+    echo "[hive:diverse] all agents dispatched"
+
+# compile-agent: compile a sandboxed single-file AGENTS.md for a specific role.
+# Output = AGENTS.md boilerplate prefix + role supplement + random transferable skills.
+# Operator provisions by running: just compile-agent --role=backend --out=/tmp/agent.md
+compile-agent role="worker" n_skills="3" out="/tmp/compiled-agent.md":
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    B00T_ROOT=$(git -C "$HOME/.b00t" rev-parse --show-toplevel 2>/dev/null || echo "$HOME/.b00t")
+    AGENTS_BASE="$B00T_ROOT/AGENTS.md"
+    ROLE_SUPPLEMENT="$B00T_ROOT/AGENTS/--role={{role}}.md"
+
+    # ── Base boilerplate (everything before SESSION delimiter) ─────────────────
+    BOILERPLATE=$(sed '/── SESSION/q' "$AGENTS_BASE" | head -n -1)
+
+    # ── Role supplement ────────────────────────────────────────────────────────
+    if [ -f "$ROLE_SUPPLEMENT" ]; then
+      ROLE_CONTENT=$(cat "$ROLE_SUPPLEMENT")
+    else
+      echo "⚠️  Role supplement not found: $ROLE_SUPPLEMENT"
+      ROLE_CONTENT="## Role: {{role}} (no supplement found — using base protocol only)"
+    fi
+
+    # ── Blessing manifest ──────────────────────────────────────────────────────
+    BLESSING=$(b00t-cli blessing --manifest --role="{{role}}" 2>/dev/null \
+      || echo "# blessing manifest unavailable — run: b00t blessing --manifest --role={{role}}")
+
+    # ── Random transferable skills ─────────────────────────────────────────────
+    ALL_SKILLS=(kaizen triz six-sigma ideo mece first-principles socratic bayesian rubber-duck pre-mortem five-whys ockham)
+    SHUFFLED=($(printf '%s\n' "${ALL_SKILLS[@]}" | shuf))
+    ASSIGNED=("${SHUFFLED[@]:0:{{n_skills}}}")
+    SKILL_CONTENT=""
+    for SKILL in "${ASSIGNED[@]}"; do
+      CONTENT=$(b00t-cli learn "$SKILL" --concise 2>/dev/null | head -30 || true)
+      [ -n "$CONTENT" ] && SKILL_CONTENT=$(printf '%s\n### %s\n%s\n' "$SKILL_CONTENT" "$SKILL" "$CONTENT")
+    done
+
+    # ── Assemble compiled AGENTS.md ────────────────────────────────────────────
+    COMPILED="{{out}}"
+    TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    {
+      echo "$BOILERPLATE"
+      echo ""
+      echo "## Role: {{role}}"
+      echo ""
+      echo "$ROLE_CONTENT"
+      echo ""
+      echo "## Blessing Manifest"
+      echo ""
+      echo "$BLESSING"
+      echo ""
+      echo "## Transferable Skills (randomly assigned: ${ASSIGNED[*]})"
+      echo "# Each instantiation gets a different random subset for hive diversity."
+      echo ""
+      echo "$SKILL_CONTENT"
+      echo ""
+      echo "<!-- SESSION compiled by operator, inject per instantiation"
+      echo "Role: {{role}} | Skills: ${ASSIGNED[*]} | Compiled: $TS -->"
+    } > "$COMPILED"
+
+    echo "✅ Compiled agent: {{out}} ($(wc -l < {{out}}) lines)"
+    echo "   role: {{role}}"
+    echo "   skills: ${ASSIGNED[*]}"
+
+# ── end ralph / compile-agent ──────────────────────────────────────────────────
+
+# provision-agent: operator convenience — compile + launch agent for a role+goal in one command.
+# Usage: just provision-agent worker "implement a health endpoint"
+# Usage: just provision-agent executive "plan Q3 roadmap"
+# Operator does NOT need to know about compile-agent or ralph-spawn internals.
+provision-agent role="worker" goal="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    AGENT_FILE="/tmp/b00t-agent-{{role}}-$(date +%s).md"
+    echo "[provision] role={{role}}"
+    just compile-agent "{{role}}" 3 "$AGENT_FILE"
+    echo "[provision] sandbox: $AGENT_FILE"
+    if [ -z "{{goal}}" ]; then
+      echo "[provision] no goal specified — agent file ready, launch manually:"
+      echo "  claude --agent $AGENT_FILE"
+    else
+      echo "[provision] launching agent with goal: {{goal}}"
+      GOAL_TEXT="{{goal}}"
+      echo "# Goal: $GOAL_TEXT" >> "$AGENT_FILE"
+      just ralph-spawn "$GOAL_TEXT" 3 | claude --print --agent "$AGENT_FILE" 2>/dev/null \
+        || echo "[provision] agent ready at: $AGENT_FILE (manual launch required if claude not in PATH)"
+    fi
+
+# PRD-011 G1
+b00t-metrics:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    datums="$(
+      find _b00t_ -maxdepth 1 -type f -printf '%f\n' \
+        | awk '
+            {
+              ext = "no_ext"
+              if ($0 ~ /\./) {
+                ext = $0
+                sub(/^.*\./, "", ext)
+              }
+              count[ext]++
+            }
+            END {
+              for (ext in count) {
+                printf "%s\t%d\n", ext, count[ext]
+              }
+            }
+          ' \
+        | jq -Rn '
+            reduce inputs as $line (
+              {};
+              ($line | split("\t")) as $row
+              | .[$row[0]] = ($row[1] | tonumber)
+            )
+          '
+    )"
+    train_rows=0
+    if [ -f fine-tune/train.jsonl ]; then
+      train_rows="$(wc -l < fine-tune/train.jsonl | awk '{print $1}')"
+    fi
+    jq -cn \
+      --argjson datums "$datums" \
+      --argjson train_rows "$train_rows" \
+      '{datums: $datums, train_rows: $train_rows, dangling_refs: null, probe_score: null}'
+
+# ── ROCK 5C Rocket NPU / Frigate — see _b00t_/rock5c-rocket-teflon-frigate.stack.tomllmd ────
+# 🤓 Upstream Linux "Rocket" DRM accel driver + Mesa Teflon, NOT the vendor
+#    RKNN/RKLLM stack — works on the current-rockchip64 mainline kernel this
+#    host already boots, no vendor-kernel switch required. gate_0/1_5 here
+#    are read-only or scratch-only (never touch /boot); gate_1/gate_2 change
+#    live boot config or start a service — confirm with the operator before
+#    running those on a host also serving Home Assistant.
+
+# gate_0: compile the NPU overlay + apply it to a SCRATCH copy of the real DTB
+# (never touches /boot) and verify all 3 NPU cores + 3 IOMMUs report "okay".
+rocket-overlay-build src="/home/brianh/homeassistant/boot/rock-5c-rocket-npu-overlay.dts" base_dtb="/boot/dtb-6.18.35-current-rockchip64/rockchip/rk3588s-rock-5c.dtb":
+    #!/bin/bash
+    set -euo pipefail
+    command -v dtc >/dev/null || { echo "❌ dtc (device-tree-compiler) not installed"; exit 1; }
+    command -v fdtoverlay >/dev/null || { echo "❌ fdtoverlay not installed"; exit 1; }
+    WORK="$(mktemp -d)"
+    trap 'rm -rf "$WORK"' EXIT
+    echo "🔧 compiling overlay: {{src}}"
+    dtc -@ -I dts -O dtb -o "$WORK/overlay.dtbo" "{{src}}"
+    echo "🔧 applying to a scratch copy of {{base_dtb}} (NOT /boot)"
+    cp "{{base_dtb}}" "$WORK/base.dtb"
+    fdtoverlay -i "$WORK/base.dtb" -o "$WORK/merged.dtb" "$WORK/overlay.dtbo"
+    dtc -I dtb -O dts "$WORK/merged.dtb" 2>/dev/null > "$WORK/merged.dts"
+    echo "🔍 checking all 3 NPU cores + 3 IOMMUs report status = \"okay\":"
+    FAIL=0
+    for p in npu@fdab0000 iommu@fdab9000 npu@fdac0000 iommu@fdaca000 npu@fdad0000 iommu@fdada000; do
+        status="$(awk -v node="$p \\{" '$0 ~ node {f=1} f && /status =/ {print; exit} f && /};/{exit}' "$WORK/merged.dts")"
+        if echo "$status" | grep -q '"okay"'; then
+            echo "  ✅ $p: $status"
+        else
+            echo "  ❌ $p: ${status:-status line not found}"
+            FAIL=1
+        fi
+    done
+    if [ "$FAIL" -eq 0 ]; then
+        echo "✅ gate_0 PASS — overlay compiles + applies cleanly, all 6 nodes okay (scratch-only, /boot untouched)"
+    else
+        echo "❌ gate_0 FAIL — see above"
+        exit 1
+    fi
+
+# gate_1_5: read-only preflight — do the devices Frigate expects already exist?
+# Safe to run any time; reports reality, never changes anything.
+frigate-rocket-preflight:
+    #!/bin/bash
+    set -euo pipefail
+    echo "🔍 Frigate/Rocket device preflight (read-only):"
+    FAIL=0
+    for d in /dev/accel/accel0 /dev/dri /dev/media0 /dev/video1; do
+        if [ -e "$d" ]; then
+            echo "  ✅ $d exists"
+        else
+            echo "  ❌ $d missing"
+            FAIL=1
+        fi
+    done
+    if [ "$FAIL" -eq 0 ]; then
+        echo "✅ preflight PASS"
+    else
+        echo "⚠️  preflight incomplete — expected before gate_1 (overlay install + reboot); see _b00t_/rock5c-rocket-teflon-frigate.stack.tomllmd"
+    fi
+
+# gate_1: install the compiled overlay into /boot's active overlay dir + reboot.
+# ⚠️ MODIFIES LIVE BOOT CONFIG AND REBOOTS THIS HOST — this machine also runs
+#    Home Assistant/esphome/mosquitto. Confirm with the operator before running.
+#    Not auto-run by any other recipe.
+rocket-overlay-install src="/home/brianh/homeassistant/boot/rock-5c-rocket-npu-overlay.dts":
+    #!/bin/bash
+    set -euo pipefail
+    echo "⚠️  This installs a devicetree overlay into /boot and is meant to be"
+    echo "   followed by a reboot of this host (also runs Home Assistant)."
+    echo "   Not auto-executed — see _b00t_/rock5c-rocket-teflon-frigate.stack.tomllmd gate_1."
+    echo "   Manual steps once confirmed:"
+    echo "     sudo dtc -@ -I dts -O dtb -o /boot/dtb/rockchip/overlay/rock-5c-rocket-npu.dtbo {{src}}"
+    echo "     echo 'user_overlays=rock-5c-rocket-npu' | sudo tee -a /boot/armbianEnv.txt"
+    echo "     sudo reboot"
+
+# gate_1 verification: run AFTER the operator reboots post rocket-overlay-install.
+# Read-only — reports whether Rocket actually bound to hardware.
+rocket-postboot-check:
+    #!/bin/bash
+    set -euo pipefail
+    echo "🔍 Rocket NPU postboot check (read-only):"
+    if [ -e /dev/accel/accel0 ]; then
+        echo "  ✅ /dev/accel/accel0 exists"
+    else
+        echo "  ❌ /dev/accel/accel0 missing — overlay not active or rocket module not bound"
+    fi
+    echo "  dmesg | grep -i rocket:"
+    dmesg 2>/dev/null | grep -i rocket || echo "    (no rocket entries in dmesg — may need: sudo dmesg | grep -i rocket)"
+
+# gate_2: start Frigate via Quadlet and confirm the Teflon detector is active.
+# ⚠️ Starts a systemd service. Only meaningful after gate_1 passes.
+frigate-start:
+    systemctl --user start frigate.service
+
+frigate-status:
+    #!/bin/bash
+    set -euo pipefail
+    systemctl --user status frigate.service --no-pager || true
+    echo "🔍 detector log (looking for teflon_tfl, watching for 'No NPU was detected'):"
+    journalctl --user -u frigate.service --no-pager -n 100 | grep -iE "teflon_tfl|No NPU was detected" || echo "  (no matching lines yet)"
+
+# 🥾 Standby cloud build server (GCP dstack dev-environment) — recipes only,
+# deliberately no new b00t-cli subcommand (YAGNI, ops tooling not a feature).
+# See docs/superpowers/specs/2026-08-10-cloud-build-server-design.md +
+# plan gleaming-jingling-nygaard + dev-env/*.yaml.
+#
+# The dstack server runs on the GCP control node (Phase 3), NOT locally.
+# One-time on your workstation:
+#   dstack project add main \
+#     --url $(cd b00t-tf && tofu output -raw gcp_control_node_endpoint) \
+#     --token <server admin token from ~/.dstack/server/config.yml on the box>
+# That points the CLI at the waker, which powers the control node on first
+# call. Recipes below export DSTACK_PROJECT=main and begin by waking it.
+
+# dstack reads the project from $DSTACK_PROJECT. "main" is the server-side
+# project the control node auto-creates. `dstack --project` is a per-subcommand
+# option (NOT `dstack -p <name> <cmd>`), so relying on the env is cleanest.
+export DSTACK_PROJECT := "main"
+_CHECKOUT := "/data/b00t"
+
+# Wake the control plane: hit the waker until it answers, then confirm the
+# operator's local dstack project reaches the server. The control node
+# self-powers-off when idle, so this is the required preamble.
+remote-doctor:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # public: Cloud Run waker URL. tailnet (Phase 2.75): the k0s-pod waker on
+    # vultr1 (deploy/k0s-waker). tofu output covers both; fall back to the
+    # tailnet default if state hasn't been refreshed.
+    URL="$(cd b00t-tf && tofu output -raw gcp_control_node_endpoint 2>/dev/null || true)"
+    URL="${URL:-http://100.109.101.1:8088}"
+    if [ -n "$URL" ]; then
+      echo "🔔 waking control plane via $URL ..."
+      curl -sf --max-time 200 --retry 5 --retry-all-errors "$URL/_waker/health" >/dev/null \
+        && echo "✅ waker up (control node starting/awake)"
+    fi
+    dstack fleet >/dev/null 2>&1 || { echo "❌ dstack project '$DSTACK_PROJECT' not reachable — run: dstack project add --name $DSTACK_PROJECT --url $URL --token <server admin token>"; exit 1; }
+    echo "✅ remote-doctor: dstack '$DSTACK_PROJECT' reachable"
+
+# One-time: upload the read-only GitHub deploy key + cache password as
+# dstack secrets the dev-environment consumes. Run after `just gcp-apply`
+# + `deploy_cp_node.py`, before the first remote-provision.
+#   just remote-bootstrap ~/.ssh/b00t_build_deploy_key <cache-password>
+# 🤓 dstack 0.20.28: `dstack secret set NAME VALUE` (positional, no --file/-y).
+remote-bootstrap deploy_key_file cache_password: remote-doctor
+    dstack secret set b00t_build_deploy_key "$(cat {{deploy_key_file}})"
+    dstack secret set cache_password '{{cache_password}}'
+    @echo "✅ secrets set: b00t_build_deploy_key, cache_password"
+
+# Enrol GitHub repo(s) onto the build plane: writes the DSTACK_URL variable +
+# DSTACK_ADMIN_TOKEN secret ci-build-plane.yml needs (personal-account repos
+# have no org secrets, so it's per-repo). Selective by design — only repos with
+# a >10min cold `cargo build`. Token via $DSTACK_ADMIN_TOKEN[_FILE] or prompt.
+#   just remote-enroll --check elasticdotventures/_b00t_
+#   just remote-enroll --label owner/repo owner/other-repo
+remote-enroll *args:
+    scripts/build-plane-enroll-repo.sh {{args}}
+
+# OpenTelemetry Collector for the build / orchestration plane
+# (containers/otel-collector/). Runs on the dstack control node or any
+# orchestration host. Set OTEL_DOWNSTREAM_ENDPOINT[+_AUTH] to fan out to a
+# hosted backend; unset = local capture only (file + prometheus :8889).
+otel-up:
+    podman-compose -f containers/otel-collector/compose.yaml up -d
+
+otel-down:
+    podman-compose -f containers/otel-collector/compose.yaml down
+
+otel-logs:
+    podman logs -f b00t-otelcol
+
+# Validate both collector configs against the pinned image (no network).
+otel-validate:
+    podman run --rm --memory=512m --cpus=1 --network=none -e OTEL_DOWNSTREAM_ENDPOINT=https://x/otlp -e OTEL_DOWNSTREAM_AUTH=x -v {{justfile_directory()}}/containers/otel-collector/otelcol-config.yaml:/c/b.yaml:ro -v {{justfile_directory()}}/containers/otel-collector/otelcol-config.downstream.yaml:/c/d.yaml:ro docker.io/otel/opentelemetry-collector-contrib:0.160.0 validate --config /c/b.yaml --config /c/d.yaml
+
+# dstack kubernetes backend on k0s + SOCI lazy pull. Authored infra — every
+# on-node step is operator-gated. See docs/runbooks/dstack-k0s-soci.md.
+# k0s-kubeconfig runs ON b00t-node; the rest drive pyinfra with --dry first.
+k0s-kubeconfig host="":
+    nats/pyinfra/files/fetch-k0s-kubeconfig.sh {{host}}
+
+# --dry pyinfra: install soci-snapshotter + wire k0s containerd (b00t-node).
+k0s-soci-plan inventory role="controller":
+    pyinfra --dry {{inventory}} nats/pyinfra/deploy_k0s_soci.py --data k0s_role={{role}}
+
+# Offline test of gcs-obj.sh's key-based (GOOGLE_APPLICATION_CREDENTIALS) auth path.
+gcs-obj-test:
+    dev-env/tests/gcs-obj-jwt-test.sh
+
+# Idempotent: fleet (nodes 0..2) then a per-branch dev-environment run named
+# `b00t-build-<branch>`. Two can run concurrently (one per fleet node); both
+# share the sccache-over-GCS cache. `branch` defaults to "dev".
+remote-provision branch="dev": remote-doctor
+    #!/usr/bin/env bash
+    set -euo pipefail
+    RUN="b00t-build-{{branch}}"
+    echo "🥾 fleet b00t-build-fleet (nodes 0..2)..."
+    dstack apply -f dev-env/b00t-build-fleet.yaml -y
+    echo "🥾 dev-environment $RUN ..."
+    dstack apply -f dev-env/b00t-build.dev-environment.yaml -n "$RUN" -y
+    dstack attach "$RUN" >/dev/null 2>&1 &
+    sleep 8
+    ssh -o ConnectTimeout=20 "$RUN" true && echo "✅ $RUN reachable"
+    echo "✅ $RUN ready — just remote-push {{branch}} && just remote-test {{branch}}"
+
+# Pushes local HEAD to a scratch branch on origin for the build box to fetch.
+# Git-native sync — no rsync, no reverse-SSH into a NAT'd local machine.
+remote-push branch:
+    git push -f origin HEAD:refs/heads/scratch/{{branch}}
+
+# Fetch + checkout the scratch branch on b00t-build-<branch> and `cargo build`.
+# Streams live over SSH. First run is cold; every run after is warm because
+# sccache replays compiled crates from GCS (target/ is local/ephemeral).
+remote-build branch="dev": (_attach ("b00t-build-" + branch))
+    ssh b00t-build-{{branch}} 'sccache --start-server 2>/dev/null; cd {{_CHECKOUT}} && git fetch origin && git checkout scratch/{{branch}} && cargo build && sccache --show-stats | grep -E "Cache hits rate|Compile requests"'
+
+# Same as remote-build, but `cargo nextest run` instead.
+remote-test branch="dev": (_attach ("b00t-build-" + branch))
+    ssh b00t-build-{{branch}} 'sccache --start-server 2>/dev/null; cd {{_CHECKOUT}} && git fetch origin && git checkout scratch/{{branch}} && cargo nextest run'
+
+# Ensure `ssh <run>` resolves — dstack 0.20.28 needs `dstack attach` to write
+# ~/.dstack/ssh/config. Backgrounded; harmless if already attached.
+_attach run="b00t-build-dev":
+    #!/usr/bin/env bash
+    ssh -o ConnectTimeout=8 {{run}} true 2>/dev/null && exit 0
+    dstack attach {{run}} >/dev/null 2>&1 &
+    for i in $(seq 1 15); do ssh -o ConnectTimeout=8 {{run}} true 2>/dev/null && exit 0; sleep 2; done
+    echo "❌ could not reach {{run}} via ssh (dstack attach)"; exit 1
+
+# Keep the control plane awake past its idle grace (e.g. a long unattended
+# build). `--release` clears the hold. Uses `gcloud compute ssh` by name+zone —
+# the control node has NO static IP and the reaper churns the ephemeral one, so
+# never cache an address; gcloud resolves it live each call.
+remote-keepalive *args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    ZONE="$(cd b00t-tf && tofu output -raw gcp_control_zone 2>/dev/null || echo australia-southeast1-a)"
+    if [ "{{args}}" = "--release" ]; then
+      gcloud compute ssh b00t-dstack-control --zone "$ZONE" --tunnel-through-iap --command 'sudo rm -f /run/b00t-cp-hold' && echo "hold released"
+    else
+      gcloud compute ssh b00t-dstack-control --zone "$ZONE" --tunnel-through-iap --command 'sudo touch /run/b00t-cp-hold' && echo "control plane held awake — clear with: just remote-keepalive --release"
+    fi
+
+# Stop a build-box run (default b00t-build-dev) — belt-and-suspenders alongside
+# the fleet's own 30m idle_duration. The control node then self-reaps once idle.
+remote-stop branch="dev":
+    dstack stop b00t-build-{{branch}} -y
+
+# Tear down EVERYTHING build-box-side (all runs + the fleet), leaving the
+# control node (which self-reaps) + the GCS sccache cache.
+remote-teardown:
+    -dstack stop --all -y
+    dstack fleet delete b00t-build-fleet -y
+
+# Force the control node off now (refuses if a fleet instance is still up).
+remote-down:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ "$(dstack fleet 2>/dev/null | sed '1d' | grep -c .)" -gt 0 ]; then
+      echo "❌ fleet non-empty — run 'just remote-stop' first"; exit 1
+    fi
+    ZONE="$(cd b00t-tf && tofu output -raw gcp_control_zone 2>/dev/null || echo australia-southeast1-a)"
+    gcloud compute instances stop b00t-dstack-control --zone "$ZONE" -q
+    @echo "💤 control node stopped (the waker will restart it on next request)"
+
+# ── #1226: Tribal build routing ──────────────────────────────────────
+# Convention: TRY remote (if it happens to be up), fall back to local
+# with sccache + mold + nextest. NEVER auto-spin infrastructure.
+# If you want remote, run `just remote-provision` FIRST, then ci-build.
+#
+# The remote builder uses dstack (GCP control node + fleet). It self-reaps
+# when idle, but a running control node costs ~$0.10/hr. The $150 surprise
+# bill came from leaving it running — don't do that.
+#
+# Local fallback: mold linker + sccache + nextest with 4-partition
+# parallelism. First run is cold (~10-15 min); subsequent runs are warm.
+ci-build branch="dev":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    RUN="b00t-build-{{branch}}"
+
+    # ── TRIAGE: is the remote builder reachable? ──
+    REMOTE_OK=false
+    if ssh -o ConnectTimeout=5 -o BatchMode=yes "$RUN" true 2>/dev/null; then
+        REMOTE_OK=true
+        echo "🟢 remote builder '$RUN' is UP — routing build there"
+    else
+        echo "🟡 remote builder '$RUN' not reachable — falling back to local"
+        echo "   (to use remote: just remote-provision {{branch}})"
+    fi
+
+    if [ "$REMOTE_OK" = true ]; then
+        # ── REMOTE PATH ──
+        echo "📤 pushing to scratch/{{branch}}..."
+        git push -f origin HEAD:refs/heads/scratch/{{branch}}
+
+        echo "🔨 remote build..."
+        ssh "$RUN" "sccache --start-server 2>/dev/null; \
+            cd {{_CHECKOUT}} && git fetch origin && git checkout scratch/{{branch}} \
+            && cargo build 2>&1 \
+            && sccache --show-stats | grep -E 'Cache hits rate|Compile requests'"
+
+        echo "🧪 remote test..."
+        ssh "$RUN" "sccache --start-server 2>/dev/null; \
+            cd {{_CHECKOUT}} && cargo nextest run 2>&1"
+
+        echo "🛑 stopping remote builder to save cost..."
+        dstack stop "$RUN" -y 2>/dev/null || true
+        echo "✅ remote build+test complete, builder stopped"
+    else
+        # ── LOCAL PATH ──
+        echo "🔨 local build (sccache + mold + nextest)..."
+        export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/.cache/b00t-cargo-target}"
+        sccache --start-server 2>/dev/null || true
+
+        cargo build --workspace 2>&1
+        echo ""
+        echo "🧪 local test (nextest, all partitions)..."
+        cargo nextest run --workspace 2>&1
+        echo ""
+
+        sccache --show-stats 2>/dev/null | grep -E "Cache hits rate|Compile requests" || true
+        echo "✅ local build+test complete"
+    fi
+
+# Show current build cache stats (sccache hit rate, target dir size).
+ci-stats:
+    @echo "── sccache ──"
+    @sccache --show-stats 2>/dev/null | grep -E "Cache hits rate|Compile requests|Cache size" || echo "sccache not running"
+    @echo ""
+    @echo "── target dir ──"
+    @du -sh "${CARGO_TARGET_DIR:-$HOME/.cache/b00t-cargo-target}" 2>/dev/null || echo "no target dir"
+    @echo ""
+    @echo "── remote builder ──"
+    @ssh -o ConnectTimeout=3 -o BatchMode=yes b00t-build-dev true 2>/dev/null && echo "🟢 b00t-build-dev UP" || echo "🟡 b00t-build-dev DOWN (expected — spin up with: just remote-provision)"

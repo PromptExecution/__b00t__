@@ -1,0 +1,188 @@
+# dstack — Multi-Cloud GPU Orchestration
+#
+# dstack provisions GPU workloads across RunPod, AWS, GCP, Azure, Lambda,
+# Kubernetes, and bare metal through one CLI/API. b00t uses it as the
+# provider-agnostic backend with configured backends for RunPod, AWS, GCP,
+# and Azure, so any single cloud is optional infrastructure, not a hard
+# dependency for running AI jobs.
+#
+# Auth: configured via `dstack server` backend config (see
+#   https://dstack.ai/docs/reference/server/config.yml); no single
+#   DSTACK_API_KEY env var — each backend cloud has its own credentials.
+# Install: uv tool install 'dstack[all]'
+#
+# No official Rust SDK exists for dstackai/dstack (CLI + Python SDK + REST
+# API only) — b00t's DstackProvider shells out to the CLI, same pattern as
+# HfProvider's `hf jobs` wrapper.
+#
+# Run states (verified against dstackai/dstack source): pending, submitted,
+# provisioning, running, terminating, terminated, failed, done.
+# finished_statuses = [terminated, failed, done]. No separate "pulling"
+# state — cold-start time is absorbed into `provisioning`.
+#
+# 🤓 TRIZ note 2026-07-22: one-shot batch dispatch (fresh pod per job) burns
+#    real budget on cold-boot with "repetitive types of jobs" (operator's
+#    own framing, after ~25% of a RunPod budget with zero completions).
+#    Persistent volumes (`type: volume`, verified against dstack docs to
+#    survive across separate `dstack apply` runs) resolve the reproducibility-
+#    vs-speed contradiction: stage image/deps/datasets once, dispatch many
+#    jobs against the same warm environment. Use `ensure-volume` below for
+#    that path; plain `job submit-batch` stays right for genuine one-offs.
+#
+# b00t CLI: b00t provider job submit-batch|status|cancel|list --provider dstack
+#           b00t-cli provider dstack ensure-volume|stop-dev-environment
+
+[b00t]
+name          = "PROVIDER-DSTACK"
+type          = "api"
+hint          = "dstack multi-cloud GPU orchestration provider — CLI shell-out backend for ComputeProvider, with persistent-volume support for repeated iteration"
+type_tags     = ["provider", "training", "batch", "gpu", "cloud", "multi-cloud", "orchestration"]
+install       = { uv_tool = "dstack[all]", binary = "dstack" }
+version       = "dstack --version"
+version_regex = '(\d+\.\d+\.\d+)'
+
+[resource]
+name        = "dstack"
+console_url = "https://dstack.ai"
+cli_install = "uv tool install 'dstack[all]'"
+
+[resource.run_states]
+pending      = { bucket = "pending" }
+submitted    = { bucket = "pending" }
+provisioning = { bucket = "pending" }
+running      = { bucket = "running" }
+terminating  = { bucket = "terminal" }
+terminated   = { bucket = "terminal", failure = true }
+failed       = { bucket = "terminal", failure = true }
+done         = { bucket = "terminal", failure = false }
+
+[resource.secrets.runpod_api_key]
+# 🤓 dstack's RunPod backend (verified against installed 0.20.28 source:
+#    core/backends/runpod/models.py's RunpodAPIKeyCreds + server/services/
+#    config.py's plain yaml.safe_load) accepts ONLY a literal creds.api_key
+#    string in ~/.dstack/server/config.yml — no ${VAR} interpolation, no
+#    env-var-chain creds type for this backend. Never hand-author or commit
+#    that file with a literal key. Generate it at runtime with
+#    `just dstack-server-config` (justfile-dstack-sdd.just), which sources
+#    RUNPOD_API_KEY from .env fresh each run. See _b00t_/learn/managing-secrets.md.
+required = true
+source_provider = "dotenv"
+source_path     = ".env"
+source_key      = "RUNPOD_API_KEY"
+delivery_type   = "file"
+delivery_path   = "~/.dstack/server/config.yml"
+delivery_via    = "just dstack-server-config"
+
+[resource.secrets.gcp_credentials]
+# 🤓 dstack's GCP backend (verified against installed source: core/backends/
+#    gcp/models.py's GCPDefaultCreds) uses Application Default Credentials
+#    (ambient auth via `gcloud auth application-default login` or GOOGLE_*
+#    env vars). No literal credentials file needed in ~/.dstack/server/config.yml.
+#    The recipe defaults GCP_PROJECT_ID to "app4dog" if unset; override via
+#    .env if needed. Source: _b00t_/learn/managing-secrets.md.
+required = false
+source_provider = "gcloud-adc"
+delivery_type   = "ambient"
+
+[resource.secrets.aws_credentials]
+# 🤓 dstack's AWS backend (verified against installed source: core/backends/
+#    aws/models.py's AWSDefaultCreds) uses ambient credentials via boto3's
+#    standard credential chain (IAM role, ~/.aws/credentials, AWS_* env vars).
+#    No literal credentials needed. The recipe picks this authentication over
+#    the alternative AWSAccessKeyCreds type (which requires explicit access/secret
+#    keys and is not used here). See _b00t_/learn/managing-secrets.md.
+required = false
+source_provider = "aws-ambient"
+delivery_type   = "ambient"
+
+[resource.secrets.azure_credentials]
+# 🤓 dstack's Azure backend (verified against installed source: core/backends/
+#    azure/models.py's AzureDefaultCreds + server/services/config.py) uses
+#    ambient credentials (type: "default") for the creds block itself. However,
+#    Azure's AzureBackendConfig REQUIRES two additional top-level fields outside
+#    creds: tenant_id and subscription_id (account-specific GUIDs). These are
+#    sourced from .env with hard-fail checks if missing (unlike GCP/AWS, purely
+#    ambient). Generate ~/.dstack/server/config.yml at runtime with
+#    `just dstack-server-config` (justfile-dstack-sdd.just), which sources
+#    AZURE_TENANT_ID and AZURE_SUBSCRIPTION_ID fresh each run, failing if unset.
+#    See _b00t_/learn/managing-secrets.md.
+required = true
+source_provider = "dotenv"
+source_path     = ".env"
+source_keys     = ["AZURE_TENANT_ID", "AZURE_SUBSCRIPTION_ID"]
+delivery_type   = "file"
+delivery_path   = "~/.dstack/server/config.yml"
+delivery_via    = "just dstack-server-config"
+
+[resource.cost_control]
+# 🤓 volumes bill for storage only while idle (cheap); dev-environments bill
+#    for compute while idle unless inactivity_duration is set — always set it.
+volume_idle_cost = "storage-rate only, no compute charge"
+dev_environment_default = "set inactivity_duration on every dev-environment config — no default auto-shutdown otherwise"
+
+[resource.build_plane]
+# 🤓 The b00t GCP build plane (see _b00t_/build-plane.tomllm) runs its OWN
+#    dstack server on a dedicated GCP control node — NOT the local
+#    ~/.dstack/server + `just dstack-server-config` path above. That control
+#    node's config is rendered by nats/pyinfra/deploy_cp_node.py from
+#    templates/dstack-server-config.yml.j2: GCP backend ONLY, `creds: type:
+#    default` (the VM's attached SA via metadata — no key file, no WIF for the
+#    server). RunPod is DEFERRED there (backup backend only, not wired in v1;
+#    RUNPOD_API_KEY stays in ~/.env untouched). The local multi-backend recipe
+#    stays for workstation experiments.
+project        = "b00t"
+server_host    = "GCP control node b00t-dstack-control (systemd dstack-server.service)"
+server_url     = "the pingap waker — `tofu output -raw gcp_control_node_endpoint`"
+backend        = "gcp only (regions: [australia-southeast1], vm_service_account: b00t-build-vm)"
+runpod         = "deferred — re-add `- type: runpod` + --data guard if ever needed"
+recipes        = "just remote-doctor | remote-provision | remote-push | remote-test | remote-keepalive | remote-down"
+
+[resource.build_plane.repo_auth]
+# The private repo `elasticdotventures/_b00t_` is cloned in the dev-env init:.
+# Options, simplest first:
+#   1. read-only Deploy key -> `dstack secret set b00t_build_deploy_key` (done
+#      2026-09-08; operator added the .pub to repo Settings -> Deploy keys).
+#   2. GitHub App installation token (org-wide, auto-rotating) — the org has an
+#      App; preferred long-term. Wire via `gh api` / a token-minting step in init:.
+# The vendor/* submodules (embed-anything-b00t, tomllm, runpod-sdk) are PUBLIC
+# https — no auth needed. Only _b00t_ itself needs a credential.
+
+[resource.build_plane.cli_0_20_28]
+# 🤓 Verified against installed dstack 0.20.28 (2026-09-08), corrections vs the
+# original build-plane design:
+project        = "server-side project name is 'main' (dstack auto-creates it + writes ~/.dstack/config.yml). `dstack project add --name main --url <waker> --token <server admin token>`."
+project_flag   = "`--project` is a PER-SUBCOMMAND option (default $DSTACK_PROJECT), NOT `dstack -p <name> <cmd>`."
+ssh            = "NO top-level `dstack ssh` — use `dstack attach <run>` (writes ~/.dstack/ssh/config with `Host <run>`), then plain `ssh <run>`."
+secret         = "`dstack secret set NAME VALUE` (positional; no --file/--value/-y). Bare `env: - NAME` in a dev-env resolves NAME from a secret of the same name."
+repo           = "dev-env `files:` maps local files onto the box (used to ship cache-up.sh before the checkout exists). `repos:` / `dstack init` also mount the local repo natively."
+
+[[resource.usages]]
+description = "Submit a one-off batch job via b00t CLI (provider-agnostic) — fresh pod, no volume"
+command     = "b00t-cli provider job submit-batch --provider dstack --image <image> --config <path> --flavor <flavor>"
+
+[[resource.usages]]
+description = "Check job status"
+command     = "b00t-cli provider job status --provider dstack <run-name>"
+
+[[resource.usages]]
+description = "Cancel a job"
+command     = "b00t-cli provider job cancel --provider dstack <run-name>"
+
+[[resource.usages]]
+description = "Provision (idempotent) a persistent volume for repeated-iteration jobs"
+command     = "b00t-cli provider dstack ensure-volume <name> --size-gb <n> --region <region>"
+
+[[resource.usages]]
+description = "Stop a dev-environment / warm run explicitly (cost control — see [resource.cost_control])"
+command     = "b00t-cli provider dstack stop-dev-environment <name>"
+
+[[resource.usages]]
+description = "Run the full warm-dispatch pattern (resource gate -> ensure volume -> dstack job)"
+command     = "b00t-cli job run mesh3d-cloud-warm"
+
+# b00t:map v1
+# summary: dstack multi-cloud GPU orchestration provider — CLI shell-out backend for ComputeProvider, with persistent-volume support for repeated iteration
+# tags: provider, dstack, orchestration, multi-cloud, gpu, batch, training, volume, cost-control
+# tier: frontier
+# cmds: b00t-cli provider job submit-batch --provider dstack, b00t-cli provider dstack ensure-volume
+# complexity: 4

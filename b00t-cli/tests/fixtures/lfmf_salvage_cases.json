@@ -48,9 +48,44 @@
     {
       "name": "empty_topic_salvaged",
       "raw": ": just a body here",
-      "topic": "just a body here",
+      "topic": "just a body…",
       "body": "just a body here",
       "salvage": "empty_part"
+    },
+    {
+      "name": "no_colon_fits_entirely_under_topic_max_934",
+      "raw": "keep secrets out of logs",
+      "topic": "keep secrets out of…",
+      "body": "keep secrets out of logs",
+      "salvage": "no_colon"
+    },
+    {
+      "name": "no_colon_single_word_topic_equals_body_934",
+      "raw": "atomicity",
+      "topic": "atomicity",
+      "body": "atomicity",
+      "salvage": "no_colon"
+    },
+    {
+      "name": "colon_in_body_not_defeated",
+      "raw": "atomic commits: commit small then verify tests: all green",
+      "topic": "atomic commits",
+      "body": "commit small then verify tests: all green",
+      "salvage": null
+    },
+    {
+      "name": "unicode_survives_intact",
+      "raw": "emoji topic 🍰: proceed with 🚀 confidence in 中文 text",
+      "topic": "emoji topic 🍰",
+      "body": "proceed with 🚀 confidence in 中文 text",
+      "salvage": null
+    },
+    {
+      "name": "embedded_newline_preserved",
+      "raw": "multiline lesson: line one\nline two continues here",
+      "topic": "multiline lesson",
+      "body": "line one\nline two continues here",
+      "salvage": null
     }
   ]
 }

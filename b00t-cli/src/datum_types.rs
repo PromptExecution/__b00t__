@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use ufo_types::{Stereotyped, UfoStereotype};
 
 // ── DatumType — b00t's typed datum registry ────────────────────────────────
 // 🤓 single source of truth: add new variants ONLY here. The macro below derives:
@@ -21,9 +22,15 @@ pub enum DatumType {
     Stack,
     Repo,
     Role,
+    /// A signed, versioned agent-r0le package (`.agentprofile.toml`) — the
+    /// artifact b00t.promptexecution.com issues and b00t-mcp enforces.
+    AgentProfile,
     Bash,
     Vscode,
     K8s,
+    /// Raw Kubernetes Pod manifest deployed via `podman kube play` — no Helm,
+    /// no docker-compose, no cluster. See datum_podman.rs.
+    Podman,
     Apt,
     Nix,
     Mcp,
@@ -44,6 +51,21 @@ pub enum DatumType {
     Polyseme,
     Runtime,
     Training,
+    /// **Reserved — not yet implemented.** No `McpServerDatum` struct exists, and this
+    /// variant is not wired into `main.rs` dispatch. It is declared as a UFO `SubKind`
+    /// of `Mcp` (see `ufo_stereotype()` below) to hold a structural distinction between
+    /// a local MCP config (`Mcp`) and a deployed remote MCP server (`McpServer`) — a
+    /// distinction the codebase doesn't build out yet.
+    ///
+    /// The intended path to actually implement this is *not* a standalone
+    /// `McpServerDatum` struct: per the 2026-08-16 app4dog-workspace decision, `McpDatum`
+    /// (see `datum_mcp.rs`) is expected to gain a `deploy_targets` field instead, folding
+    /// "deployed remote server" into the existing `Mcp` datum rather than forking a
+    /// parallel type. Do not build a separate `McpServerDatum` without revisiting that
+    /// decision first.
+    ///
+    /// Kept (not removed) per the resolution of issue #1094 — see that issue for the
+    /// full investigation and the removal-vs-keep discussion.
     McpServer,
     Schema,
     Hook,
@@ -189,11 +211,12 @@ impl DatumType {
         match self {
             Self::K8s
             | Self::Docker
+            | Self::Podman
             | Self::Hardware
             | Self::Overlay
             | Self::Runtime
             | Self::Nix => SemanticClass::Infra,
-            Self::Agent | Self::Role | Self::Ai | Self::Training => SemanticClass::Agent,
+            Self::Agent | Self::Role | Self::AgentProfile | Self::Ai | Self::Training => SemanticClass::Agent,
             Self::Mcp | Self::McpServer | Self::Api | Self::Schema => SemanticClass::Protocol,
             Self::Skill | Self::Job | Self::Hook | Self::Gate | Self::Pipeline => {
                 SemanticClass::Skill
@@ -214,6 +237,14 @@ impl DatumType {
 
     /// Stereotype hierarchy: which types does this type imply?
     /// e.g. McpServer implies Mcp (server → protocol), Runtime implies Cli (can run → can check)
+    ///
+    /// 🤓 NOT the same relation as [`ufo_stereotype()`](Stereotyped::ufo_stereotype)'s
+    ///    Kind/SubKind lattice below. `implies()` is capability entailment
+    ///    ("having this type means you also have that capability"); the UFO
+    ///    lattice is structural subtyping (Guizzardi 2005 §4.2.1–4.2.2). The
+    ///    two may diverge — see `ufo_stereotype()`'s doc comment for the
+    ///    inverse cross-reference and the one point where they're pinned to
+    ///    agree (`McpServer`).
     pub const fn implies(&self) -> &'static [DatumType] {
         match self {
             Self::McpServer => &[Self::Mcp],
@@ -221,6 +252,7 @@ impl DatumType {
             Self::Agent => &[Self::Runtime],
             Self::Ai => &[Self::Agent],
             Self::Role => &[Self::Agent],
+            Self::AgentProfile => &[Self::Role],
             _ => &[],
         }
     }
@@ -231,6 +263,74 @@ impl DatumType {
     }
 
     // 🎨 display() defined below with DatumDisplay struct
+}
+
+impl Stereotyped for DatumType {
+    /// UFO Kind/SubKind lattice for datum types (Guizzardi 2005 §4.2.1–4.2.2).
+    /// 🤓 SINGLE SOURCE OF TRUTH — this is the ONLY place the lattice is
+    ///    declared. Callers (ontology sparql, BootDatum) delegate here;
+    ///    do not re-derive parent/child relationships anywhere else.
+    ///
+    /// Most variants are their own rigid Kind. Only variants with a clear,
+    /// pre-existing structural relationship are modeled as SubKind. This is
+    /// a DIFFERENT, stricter relation than `implies()` above (capability
+    /// entailment) — they may diverge; see `implies()`'s doc comment.
+    fn ufo_stereotype(&self) -> UfoStereotype {
+        match self {
+            // ── container/orchestration engines — SubKind of abstract ContainerRuntime ──
+            Self::Docker => UfoStereotype::SubKind {
+                name: stringify!(Docker).into(),
+                parent: "ContainerRuntime".into(),
+            },
+            Self::Podman => UfoStereotype::SubKind {
+                name: stringify!(Podman).into(),
+                parent: "ContainerRuntime".into(),
+            },
+            Self::K8s => UfoStereotype::SubKind {
+                name: stringify!(K8s).into(),
+                parent: "ContainerRuntime".into(),
+            },
+
+            // ── executable surface — SubKind of abstract Executable ─────────────────────
+            Self::Cli => UfoStereotype::SubKind {
+                name: stringify!(Cli).into(),
+                parent: "Executable".into(),
+            },
+            Self::Bash => UfoStereotype::SubKind {
+                name: stringify!(Bash).into(),
+                parent: "Executable".into(),
+            },
+            Self::Justfile => UfoStereotype::SubKind {
+                name: stringify!(Justfile).into(),
+                parent: "Executable".into(),
+            },
+
+            // ── package managers — SubKind of abstract PackageManager ───────────────────
+            Self::Apt => UfoStereotype::SubKind {
+                name: stringify!(Apt).into(),
+                parent: "PackageManager".into(),
+            },
+            Self::Nix => UfoStereotype::SubKind {
+                name: stringify!(Nix).into(),
+                parent: "PackageManager".into(),
+            },
+
+            // ── MCP: McpServer is-a Mcp (matches implies(): McpServer => [Mcp]) ──────────
+            // Deliberately using Mcp itself as parent (not inventing an abstract "MCP"
+            // label) — Mcp is already a real, addressable Kind elsewhere in the codebase;
+            // a third parallel label would duplicate it (see #905's warning against
+            // parallel vocabularies).
+            Self::McpServer => UfoStereotype::SubKind {
+                name: stringify!(McpServer).into(),
+                parent: "Mcp".into(),
+            },
+
+            // ── everything else: rigid Kind, name = variant name (Debug format gives
+            //    exact variant name for fieldless enum variants — zero maintenance,
+            //    stays in sync automatically as variants are added) ────────────────────
+            other => UfoStereotype::Kind(format!("{other:?}")),
+        }
+    }
 }
 
 macro_rules! datum_type_table {
@@ -306,13 +406,15 @@ impl DatumType {
         Stack       => ["stack"]                     => ".stack",
         Repo        => ["repo"]                      => ".repo",
         Role        => ["role"]                      => ".role",
+        AgentProfile => ["agent_profile", "agentprofile", "r0le"] => ".agentprofile",
         Bash        => ["bash"]                      => ".bash",
         Vscode      => ["vscode"]                    => ".vscode",
         K8s         => ["k8s"]                       => ".k8s",
+        Podman      => ["podman", "podman_kube", "kube"] => ".podman",
         Apt         => ["apt"]                       => ".apt",
         Nix         => ["nix"]                       => ".nix",
         Mcp         => ["mcp"]                       => ".mcp",
-        Cli         => ["cli"]                       => ".cli",
+        Cli         => ["cli", "verifier"]           => ".cli",
         Api         => ["api"]                       => ".api",
         Job         => ["job"]                       => ".job",
         // Ai is the umbrella; model/ai_model tokens map here (reverse dot: name.model.ai.tomllmd)
@@ -414,5 +516,80 @@ impl DatumDisplay {
             "icon": self.icon,
             "css_class": self.css_class,
         })
+    }
+}
+
+#[cfg(test)]
+mod ufo_stereotype_tests {
+    use super::*;
+
+    #[test]
+    fn every_variant_produces_a_stereotype_without_panicking() {
+        for v in DatumType::all_variants() {
+            let _ = v.ufo_stereotype();
+        }
+        let _ = DatumType::Unknown.ufo_stereotype();
+    }
+
+    #[test]
+    fn container_orchestration_cluster_shares_parent() {
+        for v in [DatumType::Docker, DatumType::Podman, DatumType::K8s] {
+            match v.ufo_stereotype() {
+                UfoStereotype::SubKind { parent, .. } => assert_eq!(parent, "ContainerRuntime"),
+                other => panic!("expected SubKind for {v:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn executable_cluster_shares_parent() {
+        for v in [DatumType::Cli, DatumType::Bash, DatumType::Justfile] {
+            match v.ufo_stereotype() {
+                UfoStereotype::SubKind { parent, .. } => assert_eq!(parent, "Executable"),
+                other => panic!("expected SubKind for {v:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn package_manager_cluster_shares_parent() {
+        for v in [DatumType::Apt, DatumType::Nix] {
+            match v.ufo_stereotype() {
+                UfoStereotype::SubKind { parent, .. } => assert_eq!(parent, "PackageManager"),
+                other => panic!("expected SubKind for {v:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn mcp_server_is_subkind_of_mcp_matching_implies() {
+        // Pins the one point where implies() and the lattice coincide.
+        assert_eq!(DatumType::McpServer.implies(), &[DatumType::Mcp]);
+        assert_eq!(
+            DatumType::McpServer.ufo_stereotype(),
+            UfoStereotype::SubKind {
+                name: "McpServer".into(),
+                parent: "Mcp".into()
+            }
+        );
+    }
+
+    #[test]
+    fn agent_profile_variant_wired() {
+        assert_eq!(DatumType::from_type_token("r0le"), Some(DatumType::AgentProfile));
+        assert_eq!(DatumType::from_type_token("agentprofile"), Some(DatumType::AgentProfile));
+        assert_eq!(DatumType::AgentProfile.semantic_class(), SemanticClass::Agent);
+        assert_eq!(DatumType::AgentProfile.implies(), &[DatumType::Role]);
+        assert_eq!(DatumType::AgentProfile.base_suffix(), ".agentprofile");
+        assert_eq!(DatumType::AgentProfile.extension(), ".agentprofile.toml");
+        assert!(DatumType::all_variants().contains(&DatumType::AgentProfile));
+    }
+
+    #[test]
+    fn unknown_is_plain_kind() {
+        assert_eq!(
+            DatumType::Unknown.ufo_stereotype(),
+            UfoStereotype::Kind("Unknown".into())
+        );
     }
 }

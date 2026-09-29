@@ -151,6 +151,7 @@ pub struct McpStdioMethod {
 /// requires_auth = true
 /// bearer_token_env_var = "API_TOKEN"
 /// transport = "httpstream"
+/// client_type = "sse"
 /// startup_timeout_sec = 15
 /// tool_timeout_sec = 90
 /// enabled_tools = ["search", "analyze"]
@@ -188,6 +189,11 @@ pub struct McpHttpStreamMethod {
     /// (Codex: env_http_headers)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub env_http_headers: Option<std::collections::HashMap<String, String>>,
+
+    /// Client transport type for `.mcp.json` / Claude Code / VS Code
+    /// (default: "http", alternative: "sse")
+    #[serde(default = "default_httpstream_client_type")]
+    pub client_type: String,
 
     // Vendor capabilities - timeout controls
     /// Server startup timeout in seconds (default: 10)
@@ -227,6 +233,10 @@ fn default_stdio_transport() -> String {
 
 fn default_httpstream_transport() -> String {
     "httpstream".to_string()
+}
+
+fn default_httpstream_client_type() -> String {
+    "http".to_string()
 }
 
 /// Multi-method MCP server configuration datum
@@ -361,6 +371,7 @@ impl McpDatum {
                         || check_command_available("uvx")
                 }
                 "docker" => check_command_available("docker"),
+                "podman" => check_command_available("podman"),
                 "internet" => true, // TODO: Add actual internet check
                 constraint if constraint.starts_with("CMD:") => {
                     check_command_available(&constraint[4..])

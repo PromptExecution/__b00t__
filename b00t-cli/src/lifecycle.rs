@@ -228,8 +228,15 @@ pub fn get_mcp_config(name: &str, path: &str) -> Result<BootDatum> {
         path_buf.display()
     ))?;
 
-    let mut config: UnifiedConfig =
-        toml::from_str(&content).context("Failed to parse MCP config TOML")?;
+    let mut config: UnifiedConfig = toml::from_str(&content).with_context(|| {
+        format!(
+            "Failed to parse MCP config TOML at {} — run with the printed \
+             toml::de::Error detail below to find the offending key/line \
+             (common cause: a field like [b00t.env] expects string values, \
+             not nested tables)",
+            path_buf.display()
+        )
+    })?;
     crate::datum_utils::apply_git_attributes_to_config(&mut config, &path_buf);
 
     Ok(config.b00t)
@@ -263,10 +270,18 @@ pub fn load_runtime_datum(name: &str, path: &str) -> Result<RuntimeConfig> {
     let config: UnifiedConfig =
         toml::from_str(&content).context(format!("Failed to parse {}", file_path.display()))?;
 
-    config
+    let datum_gate = config.b00t.gate.clone();
+    let mut runtime = config
         .b00t
         .runtime
-        .ok_or_else(|| anyhow::anyhow!("datum '{}' missing [b00t.runtime] section", name))
+        .ok_or_else(|| anyhow::anyhow!("datum '{}' missing [b00t.runtime] section", name))?;
+    // 🤓 #712: gate preconditions live on the datum (`[[b00t.gate]]`), not
+    //    nested under `[b00t.runtime]` — carry them onto RuntimeConfig here so
+    //    spawn_sandboxed can evaluate them before forking the sandbox.
+    if runtime.gate.is_none() {
+        runtime.gate = datum_gate;
+    }
+    Ok(runtime)
 }
 
 // ── Generic datum provider loader ──────────────────────────────────────

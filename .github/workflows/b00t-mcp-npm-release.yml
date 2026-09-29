@@ -48,12 +48,26 @@ jobs:
       - name: 📥 Checkout code
         uses: actions/checkout@v4
 
+      - name: 🔧 Initialize required submodules
+        run: git submodule update --init --depth 1 vendor/runpod-sdk vendor/embed-anything-b00t
+
+      - name: 🔧 Clone vendor/ledgrrr (shared worktree checkout, not a submodule)
+        run: git clone --depth 1 --branch main https://github.com/PromptExecution/ledgrrr.git vendor/ledgrrr
+
       - name: 🦀 Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
       - name: 🔧 Fix corrupted Cargo.lock
+        # 🤓 explicit shell: bash — GitHub's windows-latest runners default
+        # `run:` steps to pwsh, where `rm` aliases to Remove-Item and `-f`
+        # is ambiguous between -Filter/-Force ("Parameter cannot be
+        # processed because the parameter name 'f' is ambiguous"), failing
+        # every Windows build of this workflow. bash (via Git Bash) is
+        # available on all three OSes GitHub hosts, so this one line fixes
+        # it everywhere without OS-conditional logic.
+        shell: bash
         run: |
           rm -f Cargo.lock
           cargo check --package b00t-mcp
@@ -66,7 +80,26 @@ jobs:
       - name: 🔧 Install cross-compilation toolchain
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
+          # 🤓 Ubuntu splits arm64 packages onto ports.ubuntu.com — the
+          # runner's default sources (archive/security.ubuntu.com) only
+          # host amd64/i386. Once `dpkg --add-architecture arm64` enables
+          # the arch, an unrestricted `apt-get update` tries (and 404s)
+          # fetching arm64 Packages indices from those amd64-only mirrors,
+          # exiting 100 before ever reaching `apt-get install`. Restrict
+          # the existing sources to amd64 (handling both the deb822
+          # ubuntu.sources format Ubuntu 24.04 runners default to, and the
+          # classic one-line sources.list some images still use) and add a
+          # dedicated ports.ubuntu.com source for arm64.
           sudo dpkg --add-architecture arm64
+          CODENAME=$(. /etc/os-release && echo "$VERSION_CODENAME")
+          if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
+            sudo sed -i '/^Types: deb$/a Architectures: amd64' /etc/apt/sources.list.d/ubuntu.sources
+          fi
+          if [ -s /etc/apt/sources.list ]; then
+            sudo sed -i -E 's/^deb(-src)? /deb\1 [arch=amd64] /' /etc/apt/sources.list
+          fi
+          printf 'deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports %s main universe restricted multiverse\ndeb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports %s-updates main universe restricted multiverse\ndeb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports %s-security main universe restricted multiverse\n' \
+            "$CODENAME" "$CODENAME" "$CODENAME" | sudo tee /etc/apt/sources.list.d/arm64-ports.list
           sudo apt-get update
           sudo apt-get install -y \
             gcc-aarch64-linux-gnu \
@@ -75,6 +108,12 @@ jobs:
             libssl-dev:arm64
 
       - name: 🔨 Build binary
+        # 🤓 explicit shell: bash — same rationale as "Fix corrupted
+        # Cargo.lock" above: the `if [[ ... ]]` bash-specific syntax below
+        # never actually ran on Windows before (blocked by that earlier
+        # step's failure) but would break there too without this, since
+        # pwsh has no `[[ ]]` construct at all.
+        shell: bash
         run: |
           if [[ "${{ matrix.target }}" == "aarch64-unknown-linux-gnu" ]]; then
             export PKG_CONFIG_ALLOW_CROSS=1

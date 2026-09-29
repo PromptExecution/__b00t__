@@ -91,16 +91,22 @@ pub enum McpCommands {
     },
     #[clap(
         about = "Install MCP server to a target (see --help for list)",
-        long_about = "Install MCP server to a target application.\n\nExamples:\n  b00t-cli mcp install gh claudecode\n  b00t-cli mcp install filesystem geminicli --repo\n  b00t-cli mcp install browser-use dotmcpjson --stdio-command uvx\n  b00t-cli mcp install aws-knowledge dotmcpjson --httpstream\n  b00t-cli mcp install filesystem roocode\n  b00t-cli mcp install filesystem codex\n  b00t-cli mcp install filesystem stdout\n  b00t-cli app vscode mcp install filesystem"
+        long_about = "Install MCP server to a target application.\n\nExamples:\n  b00t-cli mcp install gh claudecode\n  b00t-cli mcp install filesystem geminicli --repo\n  b00t-cli mcp install browser-use dotmcpjson --stdio-command uvx\n  b00t-cli mcp install aws-knowledge dotmcpjson --httpstream\n  b00t-cli mcp install chrome-devtools-mcp dotmcpjson --arg-append --browser-url=http://192.168.1.150:9222\n  b00t-cli mcp install filesystem roocode\n  b00t-cli mcp install filesystem codex\n  b00t-cli mcp install filesystem stdout\n  b00t-cli app vscode mcp install filesystem"
     )]
     Install {
         #[clap(help = "MCP server name")]
         name: String,
         #[clap(value_enum, help = "Installation target")]
         target: McpInstallTarget,
-        #[clap(long, help = "Install to repository-specific location (for geminicli)")]
+        #[clap(
+            long,
+            help = "Install to repository-specific location (claudecode, codex, geminicli)"
+        )]
         repo: bool,
-        #[clap(long, help = "Install to user-global location (for geminicli)")]
+        #[clap(
+            long,
+            help = "Install to user-global location (claudecode, codex, geminicli)"
+        )]
         user: bool,
         #[clap(
             long,
@@ -109,6 +115,11 @@ pub enum McpCommands {
         stdio_command: Option<String>,
         #[clap(long, help = "Use httpstream method (for multi-source MCP configs)")]
         httpstream: bool,
+        #[clap(
+            long,
+            help = "Append one extra arg to the datum's stdio args (dotmcpjson, roocode, codex, opencode only)"
+        )]
+        arg_append: Option<String>,
     },
     #[clap(
         about = "Sync MCP servers between b00t and agent platforms",
@@ -142,7 +153,7 @@ pub enum McpCommands {
     },
     #[clap(
         about = "MCP Registry operations (list, search, install dependencies)",
-        long_about = "Interact with b00t MCP registry for server management and dependency installation.\n\nExamples:\n  b00t-cli mcp registry list\n  b00t-cli mcp registry search --tag docker\n  b00t-cli mcp registry get io.b00t/server-name\n  b00t-cli mcp registry install-deps io.b00t/server-name\n  b00t-cli mcp registry sync-official\n  b00t-cli mcp registry sync-datums --path ~/.dotfiles/_b00t_"
+        long_about = "Interact with b00t MCP registry for server management and dependency installation.\n\nExamples:\n  b00t-cli mcp registry list\n  b00t-cli mcp registry search --tag docker\n  b00t-cli mcp registry get io.b00t/server-name\n  b00t-cli mcp registry install-deps io.b00t/server-name\n  b00t-cli mcp registry sync-official\n  b00t-cli mcp registry sync-vinkius-database\n  b00t-cli mcp registry sync-datums --path ~/.dotfiles/_b00t_"
     )]
     Registry {
         #[clap(subcommand)]
@@ -228,6 +239,28 @@ Examples:\n\
         #[clap(long, help = "Output in JSON format")]
         json: bool,
     },
+    #[clap(
+        about = "Run the on-demand MCP hosting control plane (SP4-05)",
+        long_about = "Start the control plane the proxy calls to wake backend MCP servers.\n\nRoutes:\n  GET /_b00t/route/<svc>  load <svc>.mcp_server datum -> budget gate -> ensure() -> {fqdn, warm}\n  GET /_b00t/status       backend in use + every warm service\n\nExamples:\n  b00t mcp serve                          # podman backend, port 8790\n  b00t mcp serve --backend aca --port 8790\n\nEnv:\n  B00T_LEDGRRR_MODE=http|mock   pre-launch budget gate (default: mock)\n  B00T_LEDGRRR_URL              ledgrrr base URL when mode=http\n  B00T_ACA_RESOURCE_GROUP       required for --backend aca"
+    )]
+    Serve {
+        #[clap(
+            long,
+            default_value = "podman",
+            help = "Placement backend: podman (dev) or aca (Azure Container Apps)"
+        )]
+        backend: String,
+        #[clap(long, default_value_t = 8790, help = "Port to listen on (127.0.0.1)")]
+        port: u16,
+    },
+    #[clap(
+        about = "List declared McpServer datums + live placement status (SP4-10)",
+        long_about = "List every _b00t_/<svc>.mcp_server.toml datum. When $B00T_MCP_CONTROL_URL\npoints at a running `b00t mcp serve`, the WARM column reflects live state.\n\nExamples:\n  b00t mcp servers\n  b00t mcp servers --json"
+    )]
+    Servers {
+        #[clap(long, help = "Output in JSON format")]
+        json: bool,
+    },
 }
 
 #[derive(Parser)]
@@ -239,6 +272,8 @@ pub enum RegistryAction {
     },
     #[clap(about = "Search for MCP servers by keyword or tag")]
     Search {
+        #[clap(help = "Keyword in name/description (shorthand for --keyword)")]
+        query: Option<String>,
         #[clap(long, help = "Search keyword in name/description")]
         keyword: Option<String>,
         #[clap(long, help = "Search by tag")]
@@ -256,6 +291,15 @@ pub enum RegistryAction {
     },
     #[clap(about = "Sync with official MCP registry")]
     SyncOfficial,
+    #[clap(
+        about = "Sync with the Vinkius Open Data Initiative (open mcp-database dataset)",
+        long_about = "Sync from the open, no-auth github.com/vinkius-labs/mcp-database dataset \
+(one markdown file per MCP server under mcps/). Distinct from — and does NOT touch — Vinkius's \
+other, paid discover-mcp/api.vinkius.com catalog, which is unblessed and out of scope.\n\n\
+Entries whose write-up mentions an access token / API key / client secret etc. are tagged \
+'requires-token' so they can be filtered out of zero-auth searches."
+    )]
+    SyncVinkiusDatabase,
     #[clap(about = "Auto-discover MCP servers from system")]
     Discover,
     #[clap(about = "Export registry in MCP format")]
@@ -349,8 +393,10 @@ fn handle_boot(
         eprintln!("  [dry-run] would install b00t-mcp");
     } else {
         match target {
-            "opencode" => crate::opencode_install_mcp("b00t-mcp", path, None, false)?,
-            "claudecode" | "claude" => crate::claude_code_install_mcp("b00t-mcp", path)?,
+            "opencode" => crate::opencode_install_mcp("b00t-mcp", path, None, false, None)?,
+            "claudecode" | "claude" => {
+                crate::claude_code_install_mcp("b00t-mcp", path, false)?
+            }
             "vscode" => crate::vscode_install_mcp("b00t-mcp", path)?,
             "codex" => {
                 crate::codex_install_mcp(
@@ -359,13 +405,14 @@ fn handle_boot(
                     crate::utils::is_git_repo(),
                     None,
                     false,
+                    None,
                 )?;
             }
             "gemini" | "geminicli" => {
                 crate::gemini_install_mcp("b00t-mcp", path, false)?;
             }
             "dotmcpjson" => {
-                crate::dotmcpjson_install_mcp("b00t-mcp", path, None, false)?;
+                crate::dotmcpjson_install_mcp("b00t-mcp", path, None, false, None)?;
             }
             _ => anyhow::bail!("install dispatch: no MCP installer for target '{target}'"),
         }
@@ -536,6 +583,7 @@ impl McpCommands {
                 user,
                 stdio_command,
                 httpstream,
+                arg_append,
             } => {
                 // First resolve dependencies before installation
                 let deps = resolve_depends_on_chain(name, path)?;
@@ -553,7 +601,18 @@ impl McpCommands {
                 }
 
                 match target {
-                    McpInstallTarget::Claudecode => crate::claude_code_install_mcp(name, path),
+                    McpInstallTarget::Claudecode => {
+                        let use_repo = if *repo && *user {
+                            anyhow::bail!("Error: Cannot specify both --repo and --user flags");
+                        } else if *repo {
+                            true
+                        } else if *user {
+                            false
+                        } else {
+                            crate::utils::is_git_repo()
+                        };
+                        crate::claude_code_install_mcp(name, path, use_repo)
+                    }
                     McpInstallTarget::Vscode => crate::vscode_install_mcp(name, path),
                     McpInstallTarget::Codex => {
                         let use_repo = if *repo && *user {
@@ -572,6 +631,7 @@ impl McpCommands {
                             use_repo,
                             stdio_command.as_deref(),
                             *httpstream,
+                            arg_append.as_deref(),
                         )
                     }
                     McpInstallTarget::Geminicli => {
@@ -593,6 +653,7 @@ impl McpCommands {
                         path,
                         stdio_command.as_deref(),
                         *httpstream,
+                        arg_append.as_deref(),
                     ),
                     McpInstallTarget::RooCode => {
                         // Design with internal arrays so we can extend merge/symlink targets over time.
@@ -604,6 +665,7 @@ impl McpCommands {
                             path,
                             stdio_command.as_deref(),
                             *httpstream,
+                            arg_append.as_deref(),
                         )
                     }
                     McpInstallTarget::Opencode => crate::opencode_install_mcp(
@@ -611,6 +673,7 @@ impl McpCommands {
                         path,
                         stdio_command.as_deref(),
                         *httpstream,
+                        arg_append.as_deref(),
                     ),
                     McpInstallTarget::Stdout => crate::mcp_output(path, false, name),
                 }
@@ -882,6 +945,11 @@ impl McpCommands {
                 }
                 Ok(())
             }
+            McpCommands::Serve { backend, port } => {
+                let backend: crate::mcp_serve::ServeBackend = backend.parse()?;
+                crate::mcp_serve::serve(path, backend, *port).await
+            }
+            McpCommands::Servers { json } => crate::mcp_serve::list_servers(path, *json).await,
         }
     }
 }
@@ -994,13 +1062,16 @@ impl RegistryAction {
                 }
                 Ok(())
             }
-            RegistryAction::Search { keyword, tag } => {
+            RegistryAction::Search { query, keyword, tag } => {
                 let results = if let Some(tag_val) = tag {
                     registry.search_by_tag(tag_val)
-                } else if let Some(kw) = keyword {
+                } else if let Some(kw) = keyword.as_ref().or(query.as_ref()) {
                     registry.search(kw)
                 } else {
-                    anyhow::bail!("Must provide --keyword or --tag");
+                    anyhow::bail!(
+                        "Must provide a search term, --keyword, or --tag \
+                         (e.g. `b00t mcp registry search chrome-devtools`)"
+                    );
                 };
 
                 println!("🔍 Search Results ({} matches):\n", results.len());
@@ -1029,6 +1100,12 @@ impl RegistryAction {
                 println!("🔄 Syncing with official MCP registry...");
                 let count = registry.sync_official_registry().await?;
                 println!("✅ Synced {} servers from official registry", count);
+                Ok(())
+            }
+            RegistryAction::SyncVinkiusDatabase => {
+                println!("🔄 Syncing with Vinkius Open Data Initiative (mcp-database)...");
+                let count = registry.sync_vinkius_mcp_database().await?;
+                println!("✅ Synced {} servers from vinkius-mcp-database", count);
                 Ok(())
             }
             RegistryAction::Discover => {
@@ -1091,10 +1168,13 @@ fn resolve_recursive(
     visited.insert(name.to_string());
 
     // Load datum to get dependencies
+    // #1206: check .mcp.toml, .cli.toml, and bare .toml (datum type suffixes
+    // like .job.toml, .runtime.toml, etc. are encoded in the filename)
     let config_path = path.join(format!("{}.mcp.toml", name));
     let cli_config_path = path.join(format!("{}.cli.toml", name));
+    let bare_config_path = path.join(format!("{}.toml", name));
 
-    if !config_path.exists() && !cli_config_path.exists() {
+    if !config_path.exists() && !cli_config_path.exists() && !bare_config_path.exists() {
         anyhow::bail!("Datum not found: {}", name);
     }
 
@@ -1241,6 +1321,7 @@ transport = "stdio"
             user: false,
             stdio_command: None,
             httpstream: false,
+            arg_append: None,
         };
 
         // This should fail because the server doesn't exist, but should not panic

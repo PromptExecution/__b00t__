@@ -87,13 +87,41 @@ pub struct OrchestrationConfig {
 
 // ── InstallSpec types ───────────────────────────────────────────────────
 
+// 🤓 b00t task #40 (sibling of #38 / PR #1222): `InstallSpec` is untagged, so
+//    serde tries each variant in declaration order and silently falls through
+//    to the next on a mismatch rather than erroring. `PackageInstallSpec` and
+//    `ToolInstallSpec` both carry `#[serde(deny_unknown_fields)]`, but the old
+//    inline `Metadata { requires: Option<Vec<String>> } ` variant did not —
+//    and since `requires` is `Option`, an *empty* table already satisfies it.
+//    That meant a `[install]` table shaped `{ command = "..." }` or
+//    `{ cmd = "..." }` (used by sccache.cli.toml/cranelift.cli.toml via
+//    `command`, servo.cli.toml/xpra.cli.toml via `cmd`) failed `Command`
+//    (not a bare string), failed `Package`/`Tool` (deny_unknown_fields trips
+//    on the unrecognized key), and then silently matched `Metadata` anyway —
+//    dropping the unrecognized field instead of erroring — so
+//    `command_string()` returned `None` and `b00t install <name>` quietly
+//    did nothing. `CommandTable` below is a first-class variant for that
+//    table shape (accepting both the `command` and `cmd` keys actually used
+//    in the wild), and `Metadata` now denies unknown fields like its
+//    siblings, so a table that isn't recognized by any variant now errors
+//    loudly during deserialization instead of silently resolving to
+//    `Metadata`. See the `install_command_table_*` and
+//    `*_cli_install_resolves_end_to_end` tests in lib.rs.
 #[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
 #[serde(untagged)]
 pub enum InstallSpec {
     Command(String),
+    CommandTable(CommandInstallSpec),
     Package(PackageInstallSpec),
     Tool(ToolInstallSpec),
-    Metadata { requires: Option<Vec<String>> },
+    Metadata(MetadataInstallSpec),
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct CommandInstallSpec {
+    #[serde(alias = "cmd")]
+    pub command: String,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
@@ -118,22 +146,30 @@ pub struct ToolInstallSpec {
     pub version: Option<String>,
 }
 
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct MetadataInstallSpec {
+    pub requires: Option<Vec<String>>,
+}
+
 impl InstallSpec {
     pub fn command(&self) -> Option<&str> {
         match self {
             InstallSpec::Command(command) => Some(command),
+            InstallSpec::CommandTable(spec) => Some(&spec.command),
             InstallSpec::Package(_) => None,
             InstallSpec::Tool(_) => None,
-            InstallSpec::Metadata { .. } => None,
+            InstallSpec::Metadata(_) => None,
         }
     }
 
     pub fn command_string(&self) -> Option<String> {
         match self {
             InstallSpec::Command(command) => Some(command.clone()),
+            InstallSpec::CommandTable(spec) => Some(spec.command.clone()),
             InstallSpec::Package(package) => Some(package.install_script()),
             InstallSpec::Tool(tool) => tool.install_script(),
-            InstallSpec::Metadata { .. } => None,
+            InstallSpec::Metadata(_) => None,
         }
     }
 }
@@ -355,6 +391,12 @@ pub struct RuntimeConfig {
     pub isolation: Option<IsolationConfig>,
     pub hook_pre: Option<String>,
     pub hook_post: Option<String>,
+    /// Gate preconditions carried over from the owning datum's `[[b00t.gate]]`
+    /// list (#712). Populated by `load_runtime_datum`, not read directly from
+    /// a `[b00t.runtime]` TOML table — evaluated by `spawn_sandboxed` before
+    /// the sandbox forks, so a `requires_gpu`-style gate fails with a clear
+    /// pre-flight message instead of a confusing in-sandbox crash.
+    pub gate: Option<Vec<crate::GateSpec>>,
 }
 
 // ── MCP method types ───────────────────────────────────────────────────
@@ -365,6 +407,38 @@ pub struct McpMethods {
     pub stdio: Option<Vec<std::collections::HashMap<String, serde_json::Value>>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub httpstream: Option<std::collections::HashMap<String, serde_json::Value>>,
+}
+
+// ── AI provisioning types ──────────────────────────────────────────────
+// 🤓 Generic "this app needs an AI-backend credential" declaration. Any datum
+//    that sets [b00t.ai_provision] gets a b00t-server API key minted and
+//    injected as env at MCP-install time (see dispatch.rs's install_mcp
+//    functions) — not rust-doc-specific, any future consumer opts in the
+//    same way. scope is an ontology-class:action string b00t-server already
+//    understands (b00t-mcp/src/server_llm.rs::ClassPermission::parse), e.g.
+//    "b00t:EmbeddingModel:execute" or "b00t:ChatModel:execute".
+
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
+pub struct AiProvisionConfig {
+    pub scope: String,
+    #[serde(default = "default_inject_key_as")]
+    pub inject_key_as: String,
+    #[serde(default = "default_inject_base_as")]
+    pub inject_base_as: String,
+    #[serde(default = "default_server_url")]
+    pub server_url: String,
+}
+
+fn default_inject_key_as() -> String {
+    "OPENAI_API_KEY".to_string()
+}
+
+fn default_inject_base_as() -> String {
+    "OPENAI_API_BASE".to_string()
+}
+
+fn default_server_url() -> String {
+    "http://127.0.0.1:5273/v1".to_string()
 }
 
 // ── Justfile types ─────────────────────────────────────────────────────

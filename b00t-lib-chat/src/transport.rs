@@ -7,8 +7,17 @@ use std::{
 
 use async_nats::ConnectOptions;
 use futures::StreamExt;
-use tokio::{fs, io::AsyncWriteExt, net::UnixStream, time::timeout};
 use tracing::{debug, info, warn};
+
+// 🤓 `tokio::net::UnixStream` is #[cfg(unix)]-gated upstream — this crate
+// previously imported it unconditionally, which never actually compiled on
+// Windows. `LocalSocketTransport::send` does real socket I/O over it (no
+// meaningful placeholder value like agent_manager.rs's optional listener),
+// so it gets a `#[cfg(not(unix))]` twin that returns a runtime `ChatError`
+// instead. `ChatTransportKind::Nats` remains fully functional on all
+// platforms — only the `LocalSocket` path is affected.
+#[cfg(unix)]
+use tokio::{fs, io::AsyncWriteExt, net::UnixStream, time::timeout};
 
 use crate::{
     error::{ChatError, ChatResult},
@@ -161,6 +170,19 @@ impl ChatTransport {
             }
         }
     }
+
+    /// Escape hatch to the underlying `async_nats::Client` for callers that
+    /// need patterns this wrapper doesn't cover yet (e.g. request-reply
+    /// servers — see #716's `store serve --nats`). Prefer the typed
+    /// send/subscribe helpers above where they fit.
+    pub async fn raw_nats_client(&self) -> ChatResult<async_nats::Client> {
+        match self {
+            ChatTransport::Nats(t) => t.client().await,
+            ChatTransport::Local(_) => Err(ChatError::Other(
+                "raw_nats_client requires NATS transport".into(),
+            )),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -178,6 +200,7 @@ impl LocalSocketTransport {
         Ok(Self { socket_path })
     }
 
+    #[cfg(unix)]
     async fn ensure_parent_dir(path: &Path) -> ChatResult<()> {
         if let Some(parent) = path.parent() {
             if !parent.exists() {
@@ -187,6 +210,7 @@ impl LocalSocketTransport {
         Ok(())
     }
 
+    #[cfg(unix)]
     pub async fn send(&self, message: &ChatMessage) -> ChatResult<()> {
         Self::ensure_parent_dir(&self.socket_path).await?;
         let payload = serde_json::to_vec(message)?;
@@ -207,6 +231,18 @@ impl LocalSocketTransport {
         stream.write_all(b"\n").await?;
         stream.flush().await?;
         Ok(())
+    }
+
+    /// Non-unix twin: no Unix-domain-socket equivalent exists on this
+    /// platform, so sending over the local socket transport fails at
+    /// runtime rather than at compile time. Use `ChatTransportKind::Nats`
+    /// for cross-platform chat delivery.
+    #[cfg(not(unix))]
+    pub async fn send(&self, _message: &ChatMessage) -> ChatResult<()> {
+        Err(ChatError::Other(
+            "local Unix-socket chat transport is not supported on this platform; use NATS transport instead"
+                .to_string(),
+        ))
     }
 
     pub fn socket_path(&self) -> &Path {
@@ -234,6 +270,12 @@ impl RealNatsTransport {
             max_reconnect_attempts: 3,
             reconnect_delay_ms: 1000,
         }
+    }
+
+    /// Public accessor for the underlying connected `async_nats::Client`,
+    /// reusing the same connect/reconnect machinery as the typed helpers.
+    pub async fn client(&self) -> ChatResult<async_nats::Client> {
+        self.ensure_connected().await
     }
 
     async fn ensure_connected(&self) -> ChatResult<async_nats::Client> {
@@ -309,6 +351,17 @@ impl RealNatsTransport {
         format!("b00t.chat.{}.{}", msg.channel, msg.sender)
     }
 
+    /// `client.flush()`, bounded the same way every other flush in this file
+    /// already is (`ensure_connected`'s liveness probe: 1s; the reconnect
+    /// heartbeat: 2s) so a degraded connection fails fast instead of hanging
+    /// a foreground CLI command indefinitely.
+    async fn flush_with_timeout(client: &async_nats::Client) -> ChatResult<()> {
+        tokio::time::timeout(std::time::Duration::from_secs(1), client.flush())
+            .await
+            .map_err(|_| ChatError::Other("NATS flush timed out after 1s".to_string()))?
+            .map_err(|e| ChatError::Other(format!("NATS flush failed: {}", e)))
+    }
+
     async fn send(&self, message: &ChatMessage) -> ChatResult<()> {
         let client = self.ensure_connected().await?;
         let subject = Self::chat_subject(message);
@@ -317,6 +370,12 @@ impl RealNatsTransport {
             .publish(subject.clone(), payload.into())
             .await
             .map_err(|e| ChatError::Other(format!("NATS publish failed: {}", e)))?;
+        // publish() only enqueues the frame on the client's internal write
+        // buffer; a short-lived CLI process can exit (dropping the runtime)
+        // before that buffer is ever flushed to the socket, so the message
+        // never actually reaches the server despite Ok(()) being returned.
+        // Flush explicitly so send() only succeeds once the server has it.
+        Self::flush_with_timeout(&client).await?;
         debug!("NATS published to {}", subject);
         Ok(())
     }
@@ -329,6 +388,7 @@ impl RealNatsTransport {
             .publish(subject.clone(), payload.into())
             .await
             .map_err(|e| ChatError::Other(format!("NATS task publish failed: {}", e)))?;
+        Self::flush_with_timeout(&client).await?;
         info!(
             "Task {} dispatched to {} via NATS",
             task.task_id, task.to_agent
@@ -365,6 +425,15 @@ impl RealNatsTransport {
         Ok(rx)
     }
 
+    // Note: also used by long-lived callers (e.g. bridge.rs's notification_loop
+    // forwarding a child process's stdout line-by-line) where the old buffered
+    // publish() was a throughput advantage (many messages coalesced into fewer
+    // socket flushes). The added flush is a local TCP-buffer flush, not a
+    // server-ACK round-trip, so the per-message cost is expected to be small —
+    // but if a hot loop's notification volume ever grows enough for this to
+    // matter, split into a fire-and-forget variant for that caller rather than
+    // removing the flush here (this method's correctness for one-shot callers
+    // like `chat send` depends on it).
     async fn publish_notification(&self, notification: &NotificationMessage) -> ChatResult<()> {
         let client = self.ensure_connected().await?;
         let subject = notification.subject();
@@ -373,6 +442,7 @@ impl RealNatsTransport {
             .publish(subject.clone(), payload.into())
             .await
             .map_err(|e| ChatError::Other(format!("NATS notify publish failed: {}", e)))?;
+        Self::flush_with_timeout(&client).await?;
         debug!("NATS notification published to {}", subject);
         Ok(())
     }
@@ -411,6 +481,7 @@ impl RealNatsTransport {
             .publish(subject.to_string(), payload.to_vec().into())
             .await
             .map_err(|e| ChatError::Other(format!("NATS raw publish failed: {}", e)))?;
+        Self::flush_with_timeout(&client).await?;
         debug!("NATS raw published to {}", subject);
         Ok(())
     }
