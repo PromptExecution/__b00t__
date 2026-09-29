@@ -91,7 +91,7 @@ pub enum McpCommands {
     },
     #[clap(
         about = "Install MCP server to a target (see --help for list)",
-        long_about = "Install MCP server to a target application.\n\nExamples:\n  b00t-cli mcp install gh claudecode\n  b00t-cli mcp install filesystem geminicli --repo\n  b00t-cli mcp install browser-use dotmcpjson --stdio-command uvx\n  b00t-cli mcp install aws-knowledge dotmcpjson --httpstream\n  b00t-cli mcp install filesystem roocode\n  b00t-cli mcp install filesystem codex\n  b00t-cli mcp install filesystem stdout\n  b00t-cli app vscode mcp install filesystem"
+        long_about = "Install MCP server to a target application.\n\nExamples:\n  b00t-cli mcp install gh claudecode\n  b00t-cli mcp install filesystem geminicli --repo\n  b00t-cli mcp install browser-use dotmcpjson --stdio-command uvx\n  b00t-cli mcp install aws-knowledge dotmcpjson --httpstream\n  b00t-cli mcp install chrome-devtools-mcp dotmcpjson --arg-append --browser-url=http://192.168.1.150:9222\n  b00t-cli mcp install filesystem roocode\n  b00t-cli mcp install filesystem codex\n  b00t-cli mcp install filesystem stdout\n  b00t-cli app vscode mcp install filesystem"
     )]
     Install {
         #[clap(help = "MCP server name")]
@@ -115,6 +115,11 @@ pub enum McpCommands {
         stdio_command: Option<String>,
         #[clap(long, help = "Use httpstream method (for multi-source MCP configs)")]
         httpstream: bool,
+        #[clap(
+            long,
+            help = "Append one extra arg to the datum's stdio args (dotmcpjson, roocode, codex, opencode only)"
+        )]
+        arg_append: Option<String>,
     },
     #[clap(
         about = "Sync MCP servers between b00t and agent platforms",
@@ -388,7 +393,7 @@ fn handle_boot(
         eprintln!("  [dry-run] would install b00t-mcp");
     } else {
         match target {
-            "opencode" => crate::opencode_install_mcp("b00t-mcp", path, None, false)?,
+            "opencode" => crate::opencode_install_mcp("b00t-mcp", path, None, false, None)?,
             "claudecode" | "claude" => {
                 crate::claude_code_install_mcp("b00t-mcp", path, false)?
             }
@@ -400,13 +405,14 @@ fn handle_boot(
                     crate::utils::is_git_repo(),
                     None,
                     false,
+                    None,
                 )?;
             }
             "gemini" | "geminicli" => {
                 crate::gemini_install_mcp("b00t-mcp", path, false)?;
             }
             "dotmcpjson" => {
-                crate::dotmcpjson_install_mcp("b00t-mcp", path, None, false)?;
+                crate::dotmcpjson_install_mcp("b00t-mcp", path, None, false, None)?;
             }
             _ => anyhow::bail!("install dispatch: no MCP installer for target '{target}'"),
         }
@@ -577,6 +583,7 @@ impl McpCommands {
                 user,
                 stdio_command,
                 httpstream,
+                arg_append,
             } => {
                 // First resolve dependencies before installation
                 let deps = resolve_depends_on_chain(name, path)?;
@@ -624,6 +631,7 @@ impl McpCommands {
                             use_repo,
                             stdio_command.as_deref(),
                             *httpstream,
+                            arg_append.as_deref(),
                         )
                     }
                     McpInstallTarget::Geminicli => {
@@ -645,6 +653,7 @@ impl McpCommands {
                         path,
                         stdio_command.as_deref(),
                         *httpstream,
+                        arg_append.as_deref(),
                     ),
                     McpInstallTarget::RooCode => {
                         // Design with internal arrays so we can extend merge/symlink targets over time.
@@ -656,6 +665,7 @@ impl McpCommands {
                             path,
                             stdio_command.as_deref(),
                             *httpstream,
+                            arg_append.as_deref(),
                         )
                     }
                     McpInstallTarget::Opencode => crate::opencode_install_mcp(
@@ -663,6 +673,7 @@ impl McpCommands {
                         path,
                         stdio_command.as_deref(),
                         *httpstream,
+                        arg_append.as_deref(),
                     ),
                     McpInstallTarget::Stdout => crate::mcp_output(path, false, name),
                 }
@@ -1310,6 +1321,7 @@ transport = "stdio"
             user: false,
             stdio_command: None,
             httpstream: false,
+            arg_append: None,
         };
 
         // This should fail because the server doesn't exist, but should not panic

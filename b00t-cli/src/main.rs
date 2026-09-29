@@ -3574,9 +3574,10 @@ async fn main() {
                 user: false,
                 stdio_command: None,
                 httpstream: false,
+                arg_append: None,
             };
             if let Err(e) = install_cmd.execute_async(&cli.path).await {
-                eprintln!("Error: {e}");
+                eprintln!("Error: {e:#}");
                 std::process::exit(1);
             }
         }

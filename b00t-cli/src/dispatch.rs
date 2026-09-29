@@ -1474,11 +1474,15 @@ pub fn codex_install_mcp(
     _use_repo: bool,
     stdio_command: Option<&str>,
     use_httpstream: bool,
+    extra_arg: Option<&str>,
 ) -> Result<()> {
     let datum = crate::get_mcp_config(name, path)?;
     let (command, args, env, method_type) =
         select_mcp_method(&datum, stdio_command, use_httpstream)?;
-    let args = substitute_env_templates(&args);
+    let mut args = substitute_env_templates(&args);
+    if let Some(extra) = extra_arg {
+        args.push(extra.to_string());
+    }
 
     let mut codex_args = vec!["mcp".to_string(), "add".to_string()];
 
@@ -1593,6 +1597,7 @@ pub fn dotmcpjson_install_mcp(
     path: &str,
     stdio_command: Option<&str>,
     use_httpstream: bool,
+    extra_arg: Option<&str>,
 ) -> Result<()> {
     use crate::utils::get_workspace_root;
 
@@ -1611,7 +1616,10 @@ pub fn dotmcpjson_install_mcp(
 
     let (command, args, env, method_type) =
         select_mcp_method(&datum, stdio_command, use_httpstream)?;
-    let args = substitute_env_templates(&args);
+    let mut args = substitute_env_templates(&args);
+    if let Some(extra) = extra_arg {
+        args.push(extra.to_string());
+    }
 
     let server_config = if method_type == "httpstream" {
         // #1344: emit type/headers from bearer_token_env_var, http_headers, env_http_headers
@@ -1679,11 +1687,15 @@ pub fn opencode_install_mcp(
     path: &str,
     stdio_command: Option<&str>,
     use_httpstream: bool,
+    extra_arg: Option<&str>,
 ) -> Result<()> {
     let datum = crate::get_mcp_config(name, path)?;
     let (command, args, env, method_type) =
         select_mcp_method(&datum, stdio_command, use_httpstream)?;
-    let args = substitute_env_templates(&args);
+    let mut args = substitute_env_templates(&args);
+    if let Some(extra) = extra_arg {
+        args.push(extra.to_string());
+    }
 
     let mut command_arr = vec![command.clone()];
     command_arr.extend(args.clone());
@@ -1874,7 +1886,7 @@ pub fn mcp_sync_bidirectional(
                 "codex" => codex_sync_dotmcpjson(path, true),
                 "dotmcpjson" | "roocode" => {
                     for server_name in get_mcp_toml_files(path)? {
-                        dotmcpjson_install_mcp(&server_name, path, None, false)?;
+                        dotmcpjson_install_mcp(&server_name, path, None, false, None)?;
                     }
                     Ok(())
                 }
