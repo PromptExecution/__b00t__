@@ -47,3 +47,12 @@ submodule-moltis-b00t: origin/main references vendor/moltis-b00t commit 857aaed9
 
 ---
 NEVER delete corrupt git objects without first proving they are BOTH corrupt AND unreachable. The safe filter is: comm -12 <(sort corrupt.txt) <(sort unreachable.txt). `git log --find-object` only searches reachable commits — it MISSES dangling commits and will give a false "safe to delete" signal. Deleting a corrupt object that is still reachable from a live branch permanently corrupts that branch. Root cause here: OS crash created corrupt loose objects from in-flight commits; reset moved HEAD but ORIG_HEAD and reflogs may still reference those objects. Always run `git fsck --unreachable` not `git log --find-object` to classify reachability before any rm on .git/objects/.
+
+---
+build-artifact staleness: A locally-built artifact's embedded git-hash/build-hash file can lag HEAD by dozens of commits with no warning. Before treating a local build (APK, binary, bundle) as representative of current source, diff its recorded build hash against current HEAD — don't assume 'a file exists in build/' means 'built from current source'.
+
+---
+bare-repo-worktree-only: Never edit files or run builds directly in a bare repo's own top-level directory. If a bare repo (core.bare=true) has stray working files sitting in it, treat that as a legacy hazard, not a working tree — always 'git worktree add <path> <branch>' first. A concurrent process/session can check out a different branch in that same directory underneath you, silently mixing your uncommitted edits into someone else's tree.
+
+---
+worktree-on-real-disk: Create git worktrees for compiled-language work on real disk, never /tmp. tmpfs is RAM-backed, often shared and contended across every concurrent session on the host, and can silently hit 0 bytes free mid-build with no warning.

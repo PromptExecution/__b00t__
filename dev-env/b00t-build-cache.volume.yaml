@@ -1,0 +1,26 @@
+# b00t standby cloud build server — persistent cache volume.
+# See docs/superpowers/specs/2026-08-10-cloud-build-server-design.md and
+# plan gleaming-jingling-nygaard (Phases 4 + 5).
+#
+# ⚠️ OPTIONAL as of plan rev 2026-09-08b. The primary build cache is now the
+# GCS `b00t-buildcache-promptexecution` bucket (no PD standby cost),
+# mounted at /mnt/cache by dev-env/cache-up.sh. This small volume exists
+# ONLY as the fallback for `target/` if putting `target/` on the object-FS
+# mount proves too slow for Rust incremental builds (Phase 5, option (c)).
+# If you keep `target/` on /mnt/cache, do NOT apply this volume at all.
+#
+# When used: holds the git checkout + `target/` at /data/b00t. Its lifecycle
+# is independent of the dev-environment's VM — `dstack stop`/idle-timeout on
+# the fleet tears down compute, not this volume.
+type: volume
+name: b00t-build-cache
+backend: gcp
+
+# Region-bound (dstack `type: volume` schema requires it). MUST match
+# b00t-build-fleet.yaml's region — a volume only attaches to compute in its
+# own region. Plan decision #2.
+region: australia-southeast1
+
+# 30GB: just `target/` for the fallback case — the old 100GB was sized for
+# "checkout + full dep tree on a PD"; the dep tree / sccache now live in GCS.
+size: 30GB

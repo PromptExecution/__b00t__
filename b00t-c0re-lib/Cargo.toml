@@ -33,10 +33,19 @@ store-zvec = ["dep:zvec"]
 data-fabric = ["store-grafeo", "store-zvec"]
 qdrant = []  # optional Qdrant REST gate; disabled on this node (see SOUL.tomllm)
 ipc-fanout = ["dep:b00t-ipc", "data-fabric"]  # route write fanout through b00t-ipc Transport bus
+# W3C SCXML export for StateMachineIntrospection (P5b, elasticdotventures/_b00t_#1177)
+# — the shared, standards-based statechart representation any
+# StateMachineIntrospection implementor can export to, alongside the
+# existing render_mermaid_state_diagram()/render_s5(). Independent of the
+# store-* backends above; this is a document-model export, not storage.
+statechart = ["dep:scxml"]
 
 [dependencies]
 keyring = "4"
 pyo3 = { version = "0.27", features = ["extension-module"], optional = true }
+# Pinned to an exact version: small bus factor (2 contributors, 0.x semver)
+# per elasticdotventures/_b00t_#1177's crate-evaluation research.
+scxml = { version = "=0.2.2", optional = true }
 base64 = "0.22"
 aes-gcm = "0.10"
 rand = "0.8"
@@ -62,10 +71,10 @@ tokio-util = "0.7"
 shell-words = "1.1"
 rhai = "1.22.2"
 statig = "0.4.1"
-rig-core = "0.24.0"
+rig-core = { version = "0.24.0", default-features = false, features = ["reqwest-rustls"] }
 ts-rs = "11.1.0"
 schemars = "1.1.0"
-reqwest = { version = "0.12", features = ["json", "blocking"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "blocking", "rustls-tls"] }
 scraper = "0.20"
 hex = "0.4"
 tracing.workspace = true
@@ -75,17 +84,37 @@ futures = "0.3"
 cfg-if = "1.0.4"
 oxigraph = { version = "0.5.8", optional = true }
 storage-neumann = { version = "0.1", optional = true }
-helix-db = { version = "2.0", optional = true }
+helix-db = { version = "3.0", optional = true }
 grafeo = { version = "0.5.42", features = ["ai", "storage", "gql"], optional = true }
 zvec = { git = "https://github.com/zvec-ai/zvec-rust.git", tag = "v0.5.0", optional = true }
 b00t-ipc = { path = "../b00t-ipc", features = ["nats"], optional = true }
-ufo-types = { path = "../crates/ufo-types" }
+ufo-types = { workspace = true, features = ["sysml"] }
 crepe = "0.2.0"
 ascent = "0.8.0"
 syn = { version = "2.0.118", features = ["full"] }
 quote = "1.0.45"
+# used at runtime (not just tests) for shallow-cloning external MCP registry sources
+# (e.g. vinkius-mcp-database) into a scratch dir that's cleaned up on drop
+tempfile = "3.10"
+# #1101: cheap wordlist first-pass filter in front of the disclosure gate
+b00t-bouncer = { path = "../b00t-bouncer" }
 
 [dev-dependencies]
-tempfile = "3.10"
 tokio-test = "0.4"
 tracing-subscriber = "0.3"
+clap = { version = "4", features = ["derive", "env"] }
+# b00t-graph's `watch` subcommand only (SP5 continuation) -- example-scoped,
+# not a runtime dependency of the library itself. Same version already used
+# by b00t-cli's chat.rs.
+async-nats = "0.45.0"
+
+[[example]]
+name = "b00t-graph"
+path = "examples/b00t-graph.rs"
+required-features = ["store-oxigraph"]
+# Examples default to test = false in Cargo -- without this, nextest never
+# considers watch_tests as candidates at all, regardless of -E filters
+# (found the hard way: graph-oxigraph.yml went green twice with the
+# filter fixed, but its own summary line still showed 0 of the 5 new
+# tests running).
+test = true

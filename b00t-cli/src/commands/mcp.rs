@@ -142,7 +142,7 @@ pub enum McpCommands {
     },
     #[clap(
         about = "MCP Registry operations (list, search, install dependencies)",
-        long_about = "Interact with b00t MCP registry for server management and dependency installation.\n\nExamples:\n  b00t-cli mcp registry list\n  b00t-cli mcp registry search --tag docker\n  b00t-cli mcp registry get io.b00t/server-name\n  b00t-cli mcp registry install-deps io.b00t/server-name\n  b00t-cli mcp registry sync-official\n  b00t-cli mcp registry sync-datums --path ~/.dotfiles/_b00t_"
+        long_about = "Interact with b00t MCP registry for server management and dependency installation.\n\nExamples:\n  b00t-cli mcp registry list\n  b00t-cli mcp registry search --tag docker\n  b00t-cli mcp registry get io.b00t/server-name\n  b00t-cli mcp registry install-deps io.b00t/server-name\n  b00t-cli mcp registry sync-official\n  b00t-cli mcp registry sync-vinkius-database\n  b00t-cli mcp registry sync-datums --path ~/.dotfiles/_b00t_"
     )]
     Registry {
         #[clap(subcommand)]
@@ -228,6 +228,28 @@ Examples:\n\
         #[clap(long, help = "Output in JSON format")]
         json: bool,
     },
+    #[clap(
+        about = "Run the on-demand MCP hosting control plane (SP4-05)",
+        long_about = "Start the control plane the proxy calls to wake backend MCP servers.\n\nRoutes:\n  GET /_b00t/route/<svc>  load <svc>.mcp_server datum -> budget gate -> ensure() -> {fqdn, warm}\n  GET /_b00t/status       backend in use + every warm service\n\nExamples:\n  b00t mcp serve                          # podman backend, port 8790\n  b00t mcp serve --backend aca --port 8790\n\nEnv:\n  B00T_LEDGRRR_MODE=http|mock   pre-launch budget gate (default: mock)\n  B00T_LEDGRRR_URL              ledgrrr base URL when mode=http\n  B00T_ACA_RESOURCE_GROUP       required for --backend aca"
+    )]
+    Serve {
+        #[clap(
+            long,
+            default_value = "podman",
+            help = "Placement backend: podman (dev) or aca (Azure Container Apps)"
+        )]
+        backend: String,
+        #[clap(long, default_value_t = 8790, help = "Port to listen on (127.0.0.1)")]
+        port: u16,
+    },
+    #[clap(
+        about = "List declared McpServer datums + live placement status (SP4-10)",
+        long_about = "List every _b00t_/<svc>.mcp_server.toml datum. When $B00T_MCP_CONTROL_URL\npoints at a running `b00t mcp serve`, the WARM column reflects live state.\n\nExamples:\n  b00t mcp servers\n  b00t mcp servers --json"
+    )]
+    Servers {
+        #[clap(long, help = "Output in JSON format")]
+        json: bool,
+    },
 }
 
 #[derive(Parser)]
@@ -256,6 +278,15 @@ pub enum RegistryAction {
     },
     #[clap(about = "Sync with official MCP registry")]
     SyncOfficial,
+    #[clap(
+        about = "Sync with the Vinkius Open Data Initiative (open mcp-database dataset)",
+        long_about = "Sync from the open, no-auth github.com/vinkius-labs/mcp-database dataset \
+(one markdown file per MCP server under mcps/). Distinct from — and does NOT touch — Vinkius's \
+other, paid discover-mcp/api.vinkius.com catalog, which is unblessed and out of scope.\n\n\
+Entries whose write-up mentions an access token / API key / client secret etc. are tagged \
+'requires-token' so they can be filtered out of zero-auth searches."
+    )]
+    SyncVinkiusDatabase,
     #[clap(about = "Auto-discover MCP servers from system")]
     Discover,
     #[clap(about = "Export registry in MCP format")]
@@ -882,6 +913,11 @@ impl McpCommands {
                 }
                 Ok(())
             }
+            McpCommands::Serve { backend, port } => {
+                let backend: crate::mcp_serve::ServeBackend = backend.parse()?;
+                crate::mcp_serve::serve(path, backend, *port).await
+            }
+            McpCommands::Servers { json } => crate::mcp_serve::list_servers(path, *json).await,
         }
     }
 }
@@ -1031,6 +1067,12 @@ impl RegistryAction {
                 println!("✅ Synced {} servers from official registry", count);
                 Ok(())
             }
+            RegistryAction::SyncVinkiusDatabase => {
+                println!("🔄 Syncing with Vinkius Open Data Initiative (mcp-database)...");
+                let count = registry.sync_vinkius_mcp_database().await?;
+                println!("✅ Synced {} servers from vinkius-mcp-database", count);
+                Ok(())
+            }
             RegistryAction::Discover => {
                 println!("🔍 Auto-discovering MCP servers from system...");
                 let count = registry.auto_discover().await?;
@@ -1091,10 +1133,13 @@ fn resolve_recursive(
     visited.insert(name.to_string());
 
     // Load datum to get dependencies
+    // #1206: check .mcp.toml, .cli.toml, and bare .toml (datum type suffixes
+    // like .job.toml, .runtime.toml, etc. are encoded in the filename)
     let config_path = path.join(format!("{}.mcp.toml", name));
     let cli_config_path = path.join(format!("{}.cli.toml", name));
+    let bare_config_path = path.join(format!("{}.toml", name));
 
-    if !config_path.exists() && !cli_config_path.exists() {
+    if !config_path.exists() && !cli_config_path.exists() && !bare_config_path.exists() {
         anyhow::bail!("Datum not found: {}", name);
     }
 

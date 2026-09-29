@@ -82,6 +82,8 @@ use b00t_cli::datum_apt::AptDatum;
 use b00t_cli::datum_bash::BashDatum;
 use b00t_cli::datum_cli::CliDatum;
 use b00t_cli::datum_docker::DockerDatum;
+use b00t_cli::datum_k8s::K8sDatum;
+use b00t_cli::datum_podman::PodmanDatum;
 use b00t_cli::datum_mcp::McpDatum;
 use b00t_cli::datum_vscode::VscodeDatum;
 use b00t_cli::traits::*;
@@ -93,28 +95,34 @@ use b00t_cli::commands::{
     BouncerArgs, BouncerCommands, BootstrapCommands, BudgetCommands,
     ChatCommands, CliCommands, ConfigCommands, ContextCommands, CrewCommand,
     DataCommands, DatumCommands, DoctorCommands,
+    JustfileCommands,
     GhRunnerCommands,
     FocusCommands, GatesCommands, GuardCommands,
     ServerCommands,
     PipelineCommands,
+    CapabilityForgeCommands,
+    SecretCommands,
     StageCommands,
     StoreCommands,
     ContractCommands,
     GrokCommands, HiveCommands,
+    InfluenceCommands,
     InitCommands,
     JobCommands,
     provider::ProviderCommands,
+    finetune_job::FinetuneCommands,
     K8sCommands,
     LifecycleCommands, McpCommands, ModelCommands,
     ObservabilityCommands, OntologyCommands, PythonCommands, SchedulerCommands, SessionCommands, SkillCommands, SoulCommands, StackCommands,
     OodaCommands,
-    runpod::RunpodCommands,
     TaskCommands,
     PatchCommands,
     TutorialCommands, VersionCommands, VizCommands, WhatismyCommands, ZellijCommand
 
 
 };
+#[cfg(feature = "runpod")]
+use b00t_cli::commands::runpod::RunpodCommands;
 use b00t_cli::commands::install::{install_datum, run_just_install};
 use b00t_cli::commands::uninstall::uninstall_datum;
 
@@ -167,6 +175,12 @@ Example:
     },
     #[clap(about = "Agent tool authorization manifest (unlocks via learning)")]
     Blessing(b00t_cli::commands::blessing::BlessingArgs),
+
+    #[clap(about = "Build / show / verify r0le packages (DatumType::AgentProfile)")]
+    R0le(b00t_cli::commands::r0le::R0leArgs),
+
+    #[clap(about = "Agent identity — obtain / inspect b00t.promptexecution.com JWTs")]
+    Identity(b00t_cli::commands::identity::IdentityArgs),
 
     #[clap(
         about = "Record a lesson learned for a tool (lfmf = Learn From My Failure)",
@@ -240,6 +254,11 @@ Advice mode (consult prior lessons before fixing):
             help = "Record lesson globally (mutually exclusive with --repo)"
         )]
         global: bool,
+        #[clap(
+            long,
+            help = "#1101: override a global-scope disclosure-gate block (only affects --global)"
+        )]
+        force: bool,
     },
     #[clap(
         about = "Get advice for syntax errors and debugging",
@@ -271,6 +290,11 @@ The system will:
     Mcp {
         #[clap(subcommand)]
         mcp_command: McpCommands,
+    },
+    #[clap(about = "Datum + identity/authz graph (SPARQL/SHACL/KerML substrate, SP5)")]
+    Graph {
+        #[clap(subcommand)]
+        graph_command: b00t_cli::commands::graph::GraphCommands,
     },
     #[clap(about = "b00t maintenance daemon (exercise reminders, governance boot, research queue)")]
     Maintenance {
@@ -384,6 +408,19 @@ The system will:
         dashboard: bool,
         #[clap(long, help = "Show capabilities for the specified --agent/--role")]
         capabilities: bool,
+        #[clap(
+            long,
+            help = "Show full protocol dump (AGENT.md boilerplate + role supplement); default is a compact, connection-first summary"
+        )]
+        full: bool,
+    },
+    #[cfg(feature = "virtfs")]
+    #[clap(
+        about = "Mount b00t virtfs at ~/.claude/b00t (Phase 1 skeleton: read-only skills/agents/datums dirs, no dynamic content yet)"
+    )]
+    Mount {
+        #[clap(long, help = "Mount point (default: ~/.claude/b00t)")]
+        mount_point: Option<String>,
     },
     #[clap(
         name = "k0mmand3r",
@@ -425,10 +462,22 @@ The system will:
         #[clap(subcommand)]
         skill_command: SkillCommands,
     },
-    #[clap(about = "Query system information", alias = "inspect")]
+    #[clap(about = "Query system information", aliases = ["inspect"])]
     Whatismy {
         #[clap(subcommand)]
         whatismy_command: WhatismyCommands,
+    },
+    #[clap(
+        about = "Stateful system-normal checklist gate — one boolean answer from named checks",
+        long_about = "Evaluate a <name>.checklist.toml under --path and print pass/fail per check\nplus one aggregate disposition (Satisfied/Violated/Unknown — 3-valued, not\na bare bool: see CONOPS-system-normal.md). Exit code 0/1/2 respectively.\n\nExamples:\n  b00t is                       → list available checklists\n  b00t is system-normal         → run the system-normal checklist\n  b00t is system-normal --json  → full per-check disposition as JSON\n  b00t is system-normal --explain → show failure/undetermined reasons"
+    )]
+    Is {
+        #[clap(help = "Checklist name (without .checklist.toml). Omit to list available checklists.")]
+        name: Option<String>,
+        #[clap(long, help = "Output full per-check disposition as JSON")]
+        json: bool,
+        #[clap(long, help = "Show reasons for failing/undetermined checks")]
+        explain: bool,
     },
     #[clap(about = "Show status dashboard of all available tools and services")]
     // 🤓 ENTANGLED: b00t-mcp/src/mcp_tools.rs StatusCommand
@@ -464,6 +513,13 @@ The system will:
         #[clap(subcommand)]
         provider_command: ProviderCommands,
     },
+    #[clap(
+        about = "Generic fine-tuning job manifest runner — thin layer over ai-finetune.just (local/cloud dispatch, OCI-layer packaging, S3 push, AI datum registration)"
+    )]
+    Finetune {
+        #[clap(subcommand)]
+        finetune_command: FinetuneCommands,
+    },
     #[clap(about = "Job workflow orchestration with checkpoints and sub-agents")]
     Job {
         #[clap(subcommand)]
@@ -484,7 +540,7 @@ The system will:
         #[clap(subcommand)]
         chat_command: ChatCommands,
     },
-    #[clap(about = "Crew management — Operator-Player-Captain hierarchy")]
+    #[clap(about = "Crew management — Executive-Operator-Worker-Specialist hierarchy")]
     Crew {
         #[clap(subcommand)]
         crew_command: CrewCommand,
@@ -499,10 +555,25 @@ The system will:
         #[clap(subcommand)]
         datum_command: DatumCommands,
     },
+    // 🤓 Registered justfile datums — list/query/validate/ast/registry/run.
+    //    JustfileCommands + handle_justfile_command existed and were exported
+    //    from commands/mod.rs but never reachable from the CLI, so every
+    //    `[b00t.justfile]` datum was invisible to `b00t`. Wiring it here is what
+    //    makes justfile datums discoverable (e.g. `b00t justfile query pi-agent`).
+    #[clap(about = "Registered justfile datums — list, query, validate, AST, registry, run")]
+    Justfile {
+        #[clap(subcommand)]
+        justfile_command: JustfileCommands,
+    },
     #[clap(about = "Grok knowledgebase RAG system")]
     Grok {
         #[clap(subcommand)]
         grok_command: GrokCommands,
+    },
+    #[clap(about = "AL-1.0 influence attribution audit trail — log/trail/stats (#691)")]
+    Influence {
+        #[clap(subcommand)]
+        influence_command: InfluenceCommands,
     },
     #[clap(
         about = "Install a datum (auto-resolves dependencies) or run bootstrap install when no name is provided"
@@ -514,7 +585,7 @@ The system will:
         dry_run: bool,
         #[clap(long, help = "Interactive TUI installer for agent runtimes")]
         interactive: bool,
-        /// Non-interactive: comma-separated runtime IDs (claude,gemini,codex,opencode,copilot)
+        /// Non-interactive: comma-separated runtime IDs (claude,gemini,codex,opencode,copilot,pi)
         #[clap(long, value_delimiter = ',')]
         runtimes: Vec<String>,
         /// Non-interactive: install scope (global or local)
@@ -530,12 +601,20 @@ The system will:
     },
     #[clap(about = "Uninstall a datum by name (use --purge to remove from _b00t_.toml)")]
     Uninstall {
+        /// Datum name or key. Optional when --runtimes is given.
         #[clap(help = "Datum name or key, e.g. 'ripgrep' or 'ripgrep.cli'")]
-        name: String,
+        name: Option<String>,
         #[clap(long, help = "Also remove datum entry from _b00t_.toml")]
         purge: bool,
         #[clap(long, short = 'y', help = "Skip confirmation prompt")]
         yes: bool,
+        /// Inverse of `install --runtimes`: remove b00t-managed runtime content
+        /// using the install manifest (claude,gemini,codex,opencode,copilot,pi).
+        #[clap(long, value_delimiter = ',', conflicts_with = "name")]
+        runtimes: Vec<String>,
+        /// Scope for --runtimes uninstall (global or local)
+        #[clap(long, default_value = "global", requires = "runtimes")]
+        scope: String,
     },
     #[clap(about = "Bootstrap self-configuring b00t installation (Phase 0: Foundation)")]
     Bootstrap {
@@ -604,6 +683,10 @@ The system will:
     #[clap(subcommand)]
     Pipeline(PipelineCommands),
     #[clap(subcommand)]
+    Secret(SecretCommands),
+    #[clap(subcommand)]
+    CapabilityForge(CapabilityForgeCommands),
+    #[clap(subcommand)]
     Stage(StageCommands),
     #[clap(subcommand)]
     Store(StoreCommands),
@@ -662,6 +745,7 @@ The system will:
         #[clap(subcommand)]
         gh_runner_command: GhRunnerCommands,
     },
+    #[cfg(feature = "runpod")]
     #[clap(about = "RunPod GPU cloud — pods, endpoints, training")]
     Runpod {
         #[clap(subcommand)]
@@ -698,6 +782,30 @@ The system will:
     Project {
         #[clap(subcommand)]
         project_command: b00t_cli::commands::ProjectCommands,
+    },
+    #[clap(
+        about = "The literal filesystem anchor: create/discover ./_b00t_/ walking up from cwd",
+        long_about = "rep0 fills the walk-up-discovery gap in --path/_B00T_Path resolution: `rep0 init`\ncreates ./_b00t_/ (idempotent), `rep0 where` walks up from cwd looking for the\nnearest _b00t_/ (git-.git-style ancestor search) and reports it, plus what the\nglobal fallback would be. The nearest hit is also wired into --path's implicit\ndefault resolution (see resolve_datum_dir) when --path/_B00T_Path isn't given\nexplicitly."
+    )]
+    Rep0 {
+        #[clap(subcommand)]
+        rep0_command: b00t_cli::commands::Rep0Commands,
+    },
+    #[clap(
+        about = "Same _b00t_/ anchor primitive as rep0, one tier further out",
+        long_about = "r00t is rep0's own primitive applied one directory level further up the tree —\nreal example: /home/brianh/promptexecution/_b00t_, shared by sibling project\nrepos underneath it. Deliberately its own explicit subcommand rather than\nfolded into --path's silent default chain (reaching two directories up by\ndefault would be more surprising than useful)."
+    )]
+    R00t {
+        #[clap(subcommand)]
+        r00t_command: b00t_cli::commands::R00tCommands,
+    },
+    #[clap(
+        about = "Onboard this directory as a b00t project (rep0 init + soul init + ProjectProvider)",
+        long_about = "Not a plain alias of `soul` — pr0ject init composes rep0 init (./_b00t_/) +\nsoul init (./._b00t_/) + ProjectProvider backend selection/registration as one\nonboarding command. pr0ject task/reqif dispatch to the active ProjectProvider\n(mise/jira/bl/local, selected via [b00t.project] in ./_b00t_/project.toml)."
+    )]
+    Pr0ject {
+        #[clap(subcommand)]
+        pr0ject_command: b00t_cli::commands::Pr0jectCommands,
     },
     #[clap(
         about = "Agent context snapshots — save/restore reasoning state for eureka moments",
@@ -744,6 +852,24 @@ The system will:
     RunDatum {
         #[clap(help = "Datum name")]
         name: String,
+        #[clap(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
+        args: Vec<String>,
+    },
+
+    #[clap(
+        hide = true,
+        about = "🔧 mise bridge — passthrough to mise.cli datum + b00t-owned --register"
+    )]
+    Mise {
+        #[clap(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
+        args: Vec<String>,
+    },
+
+    #[clap(
+        hide = true,
+        about = "📋 usage bridge — passthrough to usage.cli datum (KDL CLI spec)"
+    )]
+    Usage {
         #[clap(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
         args: Vec<String>,
     },
@@ -1108,9 +1234,18 @@ fn show_status(
     all_tools.extend(datum_providers_to_tool_status(load_datum_providers::<
         BashDatum,
     >(path, ".bash.toml")?));
+    // ContainerRuntime SubKind siblings (see datum_types.rs's `datum_type_table!`
+    // ContainerRuntime declaration) — Docker, Podman, K8s. If a 4th
+    // ContainerRuntime variant is ever added there, wire its provider in here too.
     all_tools.extend(datum_providers_to_tool_status(load_datum_providers::<
         DockerDatum,
     >(path, ".docker.toml")?));
+    all_tools.extend(datum_providers_to_tool_status(load_datum_providers::<
+        PodmanDatum,
+    >(path, ".podman.toml")?));
+    all_tools.extend(datum_providers_to_tool_status(load_datum_providers::<
+        K8sDatum,
+    >(path, ".k8s.toml")?));
     all_tools.extend(datum_providers_to_tool_status(load_datum_providers::<
         VscodeDatum,
     >(path, ".vscode.toml")?));
@@ -1978,11 +2113,63 @@ fn execute_k0mmand3r_dispatch(path: &str, slash: &str, passthrough_args: &[Strin
     Ok(exit_code)
 }
 
+/// True when the caller explicitly named a datum directory (`--path`/`-p`
+/// flag, or `_B00T_Path` env var) rather than relying on the built-in
+/// default. Scans `raw_args` directly rather than clap's parsed output so
+/// it works even on the parse-failure path (datum-dispatch), which never
+/// gets a successfully-parsed `Cli` to inspect.
+fn path_was_explicit(raw_args: &[String]) -> bool {
+    if std::env::var("_B00T_Path").is_ok() {
+        return true;
+    }
+    raw_args
+        .iter()
+        .any(|a| a == "--path" || a == "-p" || a.starts_with("--path=") || a.starts_with("-p="))
+}
+
+/// Resolve the effective b00t datum directory. Fixes #866: previously
+/// `--path`/`_B00T_Path` always fell back to a fixed home-directory path
+/// even when running inside a git repo with its own `_b00t_/`, so
+/// project-local datums were invisible unless `--path` was passed on every
+/// single invocation. An explicit override still always wins (Postel's
+/// law) -- auto-detection only fires for the implicit/default case.
+///
+/// 🤓 (rep0/r00t design, docs/superpowers/specs/2026-09-25-...): step 2 of
+/// the 3-tier precedence -- (1) explicit --path/_B00T_Path, (2) nearest
+/// _b00t_/ walking up from cwd, (3) this fn's `fallback_path` argument --
+/// now delegates to the same general ancestor walk-up `b00t rep0 where`
+/// uses (`commands::rep0::find_b00t_ancestors`), rather than the narrower
+/// git-root-specific check this originally shipped with. Strictly more
+/// permissive: any git-root-anchored `_b00t_/` the old check found is still
+/// found (the git root is just one ancestor among the ones now walked), and
+/// it additionally finds project-local `_b00t_/` dirs that aren't at the
+/// git root, or that exist without a `.git` at all. `r00t`'s *further*
+/// ancestor hit is deliberately NOT wired in here -- see `Commands::R00t`'s
+/// long_about for why.
+fn resolve_datum_dir(fallback_path: &str, explicit: bool) -> String {
+    if explicit {
+        return fallback_path.to_string();
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        if let Some(nearest) = b00t_cli::commands::rep0::find_b00t_ancestors(&cwd)
+            .into_iter()
+            .next()
+        {
+            return nearest.to_string_lossy().to_string();
+        }
+    }
+    fallback_path.to_string()
+}
+
 #[tokio::main]
 async fn main() {
     let raw_args: Vec<String> = std::env::args().collect();
+    let path_explicit = path_was_explicit(&raw_args);
     let cli = match Cli::try_parse_from(normalize_slash_args(raw_args.clone())) {
-        Ok(cli) => cli,
+        Ok(mut cli) => {
+            cli.path = resolve_datum_dir(&cli.path, path_explicit);
+            cli
+        }
         Err(e) => {
             // --help / --version: let clap print and exit 0
             if matches!(
@@ -1995,8 +2182,15 @@ async fn main() {
             if raw_args.len() > 1 {
                 let candidate = &raw_args[1];
                 if !candidate.starts_with('-') && !candidate.starts_with('/') {
-                    let path = std::env::var("_B00T_Path")
-                        .unwrap_or_else(|_| "~/.b00t/_b00t_".to_string());
+                    // 🤓 historical fallback literal differs from Cli::path's
+                    //    default (~/.dotfiles/_b00t_ vs ~/.b00t/_b00t_) --
+                    //    pre-existing inconsistency, left as-is here rather
+                    //    than silently unified; both are still overridden by
+                    //    project-local auto-detection when not explicit.
+                    let path = resolve_datum_dir(
+                        &std::env::var("_B00T_Path").unwrap_or_else(|_| "~/.b00t/_b00t_".to_string()),
+                        path_explicit,
+                    );
                     let expanded = b00t_cli::get_expanded_path(&path)
                         .map(|p| p.to_string_lossy().to_string())
                         .unwrap_or_else(|_| shellexpand::tilde(&path).to_string());
@@ -2027,6 +2221,7 @@ async fn main() {
                                         match b00t_cli::runtime_sandbox::spawn_sandboxed(
                                             &cfg,
                                             &passthrough,
+                                            &expanded,
                                         ) {
                                             Ok(code) => std::process::exit(code),
                                             Err(err) => {
@@ -2082,7 +2277,11 @@ async fn main() {
 
                     match matches.into_iter().next() {
                         Some(b00t_cli::DatumDispatch::Runtime(cfg)) => {
-                            match b00t_cli::runtime_sandbox::spawn_sandboxed(&cfg, &passthrough) {
+                            match b00t_cli::runtime_sandbox::spawn_sandboxed(
+                                &cfg,
+                                &passthrough,
+                                &expanded,
+                            ) {
                                 Ok(code) => std::process::exit(code),
                                 Err(err) => {
                                     eprintln!("[b00t] runtime launch failed: {err}");
@@ -2114,6 +2313,7 @@ async fn main() {
                                             match b00t_cli::runtime_sandbox::spawn_sandboxed(
                                                 &cfg,
                                                 &passthrough,
+                                                &expanded,
                                             ) {
                                                 Ok(code) => std::process::exit(code),
                                                 Err(err) => {
@@ -2217,6 +2417,14 @@ async fn main() {
                 std::process::exit(1);
             }
         }
+        Some(Commands::Graph { graph_command }) => {
+            if let Err(e) =
+                b00t_cli::commands::graph::execute_async(graph_command, &cli.path).await
+            {
+                eprintln!("Error: {e:#}");
+                std::process::exit(1);
+            }
+        }
         Some(Commands::Maintenance { maintenance_args }) => {
             if let Err(e) = handle_maintenance_command(&maintenance_args).await {
                 eprintln!("Error: {e:#}");
@@ -2224,7 +2432,7 @@ async fn main() {
             }
         }
         Some(Commands::Ai { ai_command }) => {
-            if let Err(e) = ai_command.execute(&cli.path) {
+            if let Err(e) = ai_command.execute(&cli.path).await {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
@@ -2317,6 +2525,25 @@ async fn main() {
                 std::process::exit(1);
             }
         }
+        Some(Commands::R0le(r0le_args)) => {
+            if let Err(e) = b00t_cli::commands::r0le::handle_r0le(r0le_args) {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Commands::Identity(identity_args)) => {
+            if let Err(e) = b00t_cli::commands::identity::handle_identity(identity_args).await {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        #[cfg(feature = "virtfs")]
+        Some(Commands::Mount { mount_point }) => {
+            if let Err(e) = b00t_cli::virtfs::fs::mount(mount_point.clone()) {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
         Some(Commands::Whoami {
             role,
             with_skills,
@@ -2324,12 +2551,15 @@ async fn main() {
             skills,
             dashboard,
             capabilities,
+            full,
         }) => {
             if *json {
                 use b00t_c0re_lib::B00tContext;
                 match B00tContext::current() {
                     Ok(ctx) => {
                         let health = b00t_cli::commands::doctor_cmd::health_json();
+                        // #962: local model server state — running/ready/feasible/unavailable
+                        let model_server_status = whoami::model_server_status();
                         let output = serde_json::json!({
                             "agent": ctx.agent,
                             "pid": ctx.pid,
@@ -2343,6 +2573,7 @@ async fn main() {
                             "timestamp": ctx.timestamp,
                             "role": role.clone().or_else(|| std::env::var("_B00T_ROLE").ok()),
                             "health": health,
+                            "model_server_status": model_server_status.as_str(),
                         });
                         println!("{}", serde_json::to_string_pretty(&output).unwrap());
                     }
@@ -2352,7 +2583,7 @@ async fn main() {
                     ),
                 }
             } else if let Err(e) =
-                whoami::whoami(&cli.path, role.clone(), *with_skills, skills.clone())
+                whoami::whoami(&cli.path, role.clone(), *with_skills, skills.clone(), *full)
             {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
@@ -2416,6 +2647,14 @@ async fn main() {
                 std::process::exit(1);
             }
         }
+        Some(Commands::Is { name, json, explain }) => {
+            if let Err(e) =
+                b00t_cli::commands::is_cmd::execute(&cli.path, name.as_deref(), *json, *explain)
+            {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
         Some(Commands::Status {
             filter,
             installed,
@@ -2461,6 +2700,17 @@ async fn main() {
                 std::process::exit(1);
             }
         }
+        Some(Commands::Finetune { finetune_command }) => {
+            if let Err(e) = b00t_cli::commands::finetune_job::handle_finetune_command(
+                finetune_command,
+                &cli.path,
+            )
+            .await
+            {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
         Some(Commands::Task { task_command }) => {
             if let Err(e) = b00t_cli::commands::task::handle_task_command(task_command.clone()) {
                 eprintln!("Error: {}", e);
@@ -2490,7 +2740,14 @@ async fn main() {
         }
         Some(Commands::Datum { datum_command }) => {
             use b00t_cli::commands::datum::handle_datum_command;
-            if let Err(e) = handle_datum_command(&cli.path, datum_command) {
+            if let Err(e) = handle_datum_command(&cli.path, datum_command).await {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
+        Some(Commands::Justfile { justfile_command }) => {
+            use b00t_cli::commands::justfile::handle_justfile_command;
+            if let Err(e) = handle_justfile_command(justfile_command, &cli.path) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
@@ -2502,9 +2759,72 @@ async fn main() {
                 std::process::exit(1);
             }
         }
-        Some(Commands::Uninstall { name, purge, yes }) => {
-            if let Err(e) = uninstall_datum(&cli.path, &name, *yes, *purge) {
-                eprintln!("Uninstall Error: {}", e);
+        Some(Commands::Influence { influence_command }) => {
+            use b00t_cli::commands::influence::handle_influence_command;
+            if let Err(e) = handle_influence_command(influence_command) {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
+        Some(Commands::Uninstall {
+            name,
+            purge,
+            yes,
+            runtimes,
+            scope,
+        }) => {
+            // 🤓 Two distinct uninstalls:
+            //    --runtimes → manifest-aware removal of b00t-managed runtime
+            //                 content (RuntimeAdapter::uninstall).
+            //    <name>     → the datum's own `uninstall` shell script.
+            if !runtimes.is_empty() {
+                let mut runtime_ids_vec: Vec<b00t_cli::install::RuntimeId> = Vec::new();
+                let mut parse_error = false;
+                for r in runtimes.iter() {
+                    // DRY: same single source of truth as `install --runtimes`.
+                    match b00t_cli::install::RuntimeId::from_token(r) {
+                        Some(id) => runtime_ids_vec.push(id),
+                        None => {
+                            eprintln!(
+                                "Uninstall Error: unknown runtime '{}'. Valid: {}",
+                                r,
+                                b00t_cli::install::RuntimeId::all_tokens_joined()
+                            );
+                            parse_error = true;
+                        }
+                    }
+                }
+                if parse_error {
+                    std::process::exit(1);
+                }
+                let scope_val = match scope.as_str() {
+                    "local" => match std::env::current_dir() {
+                        Ok(dir) => b00t_cli::install::InstallScope::Local(dir),
+                        Err(e) => {
+                            eprintln!("Uninstall Error: cannot determine current directory: {}", e);
+                            std::process::exit(1);
+                        }
+                    },
+                    _ => b00t_cli::install::InstallScope::Global,
+                };
+                if let Err(e) = b00t_cli::install::handle_uninstall_command(
+                    Some(runtime_ids_vec),
+                    Some(scope_val),
+                    *yes,
+                ) {
+                    eprintln!("Uninstall Error: {}", e);
+                    std::process::exit(1);
+                }
+            } else if let Some(name) = name {
+                if let Err(e) = uninstall_datum(&cli.path, name, *yes, *purge) {
+                    eprintln!("Uninstall Error: {}", e);
+                    std::process::exit(1);
+                }
+            } else {
+                eprintln!(
+                    "Uninstall Error: provide a datum name, or --runtimes <{}>",
+                    b00t_cli::install::RuntimeId::all_tokens_joined()
+                );
                 std::process::exit(1);
             }
         }
@@ -2632,16 +2952,15 @@ async fn main() {
                 let mut runtime_ids_vec: Vec<b00t_cli::install::RuntimeId> = Vec::new();
                 let mut parse_error = false;
                 for r in runtimes.iter() {
-                    match r.as_str() {
-                        "claude" => runtime_ids_vec.push(b00t_cli::install::RuntimeId::Claude),
-                        "gemini" => runtime_ids_vec.push(b00t_cli::install::RuntimeId::Gemini),
-                        "codex" => runtime_ids_vec.push(b00t_cli::install::RuntimeId::Codex),
-                        "opencode" => runtime_ids_vec.push(b00t_cli::install::RuntimeId::OpenCode),
-                        "copilot" => runtime_ids_vec.push(b00t_cli::install::RuntimeId::Copilot),
-                        _ => {
+                    // 🤓 DRY: RuntimeId::from_token is the single source of truth
+                    //    for valid runtime IDs — no per-variant match arm here.
+                    match b00t_cli::install::RuntimeId::from_token(r) {
+                        Some(id) => runtime_ids_vec.push(id),
+                        None => {
                             eprintln!(
-                                "Install Error: unknown runtime '{}'. Valid: claude,gemini,codex,opencode,copilot",
-                                r
+                                "Install Error: unknown runtime '{}'. Valid: {}",
+                                r,
+                                b00t_cli::install::RuntimeId::all_tokens_joined()
                             );
                             parse_error = true;
                         }
@@ -2766,6 +3085,7 @@ async fn main() {
             lesson,
             repo: _,
             global,
+            force,
         }) => {
             // Validate required fields
             let tool = match tool.as_ref().or(positional_tool.as_ref()) {
@@ -2804,8 +3124,15 @@ async fn main() {
                     eprintln!("Error: {}", e);
                     std::process::exit(1);
                 }
+            // `lfmf status <tool>` — cross-reference lesson-store health
+            // (fail/skip counts, error rate, latest failure) for one tool.
+            } else if tool == "status" {
+                if let Err(e) = b00t_cli::commands::lfmf::handle_lfmf_status(&lesson) {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
             } else if let Err(e) =
-                b00t_cli::commands::lfmf::handle_lfmf(&cli.path, &tool, &lesson, scope).await
+                b00t_cli::commands::lfmf::handle_lfmf(&cli.path, &tool, &lesson, scope, *force).await
             {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
@@ -2814,7 +3141,7 @@ async fn main() {
         Some(Commands::Bootstrap { bootstrap_command }) => {
             use b00t_cli::commands::bootstrap::handle_bootstrap_command;
 
-            if let Err(e) = handle_bootstrap_command(bootstrap_command.clone()).await {
+            if let Err(e) = handle_bootstrap_command(bootstrap_command.clone(), &cli.path).await {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
@@ -2901,6 +3228,8 @@ async fn main() {
                             );
                             // emit FOCUS records to ledgrrr-mcp MCP server (best-effort)
                             experiment::emit_focus_to_ledgrrr_mcp(&cmp, "http://localhost:8001");
+                            // emit OTEL span for regression tracking (issue #404)
+                            experiment::emit_experiment_otel_span(&cmp);
                             // Calculate and issue cake payout
                             experiment::calculate_and_issue_cake(&cmp);
                         }
@@ -2959,6 +3288,20 @@ async fn main() {
                 std::process::exit(1);
             }
         }
+        Some(Commands::Secret(cmd)) => {
+            if let Err(e) = b00t_cli::commands::secret::handle_secret_command(&cmd) {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
+        Some(Commands::CapabilityForge(cmd)) => {
+            if let Err(e) =
+                b00t_cli::commands::capability_forge::handle_capability_forge_command(&cmd)
+            {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
         Some(Commands::Stage(cmd)) => {
             if let Err(e) = b00t_cli::commands::stage::handle_stage_command(&cmd, &cli.path) {
                 eprintln!("Error: {}", e);
@@ -2966,7 +3309,7 @@ async fn main() {
             }
         }
         Some(Commands::Store(args)) => {
-            if let Err(e) = b00t_cli::commands::store::handle_store_command(&args) {
+            if let Err(e) = b00t_cli::commands::store::handle_store_command(&args).await {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
@@ -3074,6 +3417,7 @@ async fn main() {
                 std::process::exit(1);
             }
         }
+        #[cfg(feature = "runpod")]
         Some(Commands::Runpod { runpod_command }) => {
             if let Err(e) = b00t_cli::commands::runpod::handle_runpod(runpod_command.clone()).await
             {
@@ -3103,6 +3447,30 @@ async fn main() {
         }
         Some(Commands::Project { project_command }) => {
             if let Err(e) = project_command.execute() {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Commands::Rep0 { rep0_command }) => {
+            // 🤓 literal kept in sync with `Cli::path`'s own `default_value`
+            //    below (a pre-existing inconsistency already documented near
+            //    resolve_datum_dir's other historical-fallback literal --
+            //    left as-is rather than silently unified).
+            if let Err(e) =
+                b00t_cli::commands::rep0::handle_rep0_command(rep0_command, "~/.dotfiles/_b00t_")
+            {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Commands::R00t { r00t_command }) => {
+            if let Err(e) = b00t_cli::commands::r00t::handle_r00t_command(r00t_command) {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Commands::Pr0ject { pr0ject_command }) => {
+            if let Err(e) = b00t_cli::commands::pr0ject::handle_pr0ject_command(pr0ject_command) {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
             }
@@ -3214,7 +3582,8 @@ async fn main() {
             let passthrough: Vec<String> = args.iter().map(|s| s.to_string()).collect();
             match b00t_cli::resolve_datum_dispatch(name, &expanded) {
                 Some(b00t_cli::DatumDispatch::Runtime(cfg)) => {
-                    match b00t_cli::runtime_sandbox::spawn_sandboxed(&cfg, &passthrough) {
+                    match b00t_cli::runtime_sandbox::spawn_sandboxed(&cfg, &passthrough, &expanded)
+                    {
                         Ok(code) => std::process::exit(code),
                         Err(err) => {
                             eprintln!("[b00t] runtime launch failed: {err}");
@@ -3248,6 +3617,86 @@ async fn main() {
                 }
                 None => {
                     eprintln!("[b00t] datum '{name}' not found");
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        Some(Commands::Mise { args }) => {
+            // Check for --register flag
+            if args.iter().any(|a| a == "--register") {
+                let dry_run = args.iter().any(|a| a == "--dry-run");
+                let global = args.iter().any(|a| a == "--global");
+                let config = b00t_cli::commands::mise::RegisterConfig {
+                    dry_run,
+                    global,
+                    b00t_datum_dir: std::path::PathBuf::from(&cli.path),
+                };
+                if let Err(e) = b00t_cli::commands::mise::handle_register(&config) {
+                    eprintln!("[b00t] mise register: {e}");
+                    std::process::exit(1);
+                }
+            } else {
+                // Passthrough to mise.cli datum
+                let expanded = shellexpand::tilde(&cli.path).to_string();
+                let name = "mise.cli";
+                let passthrough: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+                match b00t_cli::resolve_datum_dispatch(name, &expanded) {
+                    Some(b00t_cli::DatumDispatch::CliPassthrough {
+                        command,
+                        args: cmd_args,
+                    }) => {
+                        let mut all_args = cmd_args;
+                        all_args.extend(passthrough);
+                        let status = std::process::Command::new(&command)
+                            .args(&all_args)
+                            .status()
+                            .unwrap_or_else(|err| {
+                                eprintln!("[b00t] {command}: {err}");
+                                std::process::exit(1);
+                            });
+                        std::process::exit(status.code().unwrap_or(1));
+                    }
+                    Some(_other) => {
+                        eprintln!("[b00t] mise.cli resolved to unexpected dispatch type");
+                        std::process::exit(1);
+                    }
+                    None => {
+                        eprintln!("[b00t] mise.cli datum not found");
+                        eprintln!("       Install mise: b00t cli install mise.cli");
+                        std::process::exit(1);
+                    }
+                }
+            }
+        }
+
+        Some(Commands::Usage { args }) => {
+            let expanded = shellexpand::tilde(&cli.path).to_string();
+            let name = "usage.cli";
+            let passthrough: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+            match b00t_cli::resolve_datum_dispatch(name, &expanded) {
+                Some(b00t_cli::DatumDispatch::CliPassthrough {
+                    command,
+                    args: cmd_args,
+                }) => {
+                    let mut all_args = cmd_args;
+                    all_args.extend(passthrough);
+                    let status = std::process::Command::new(&command)
+                        .args(&all_args)
+                        .status()
+                        .unwrap_or_else(|err| {
+                            eprintln!("[b00t] {command}: {err}");
+                            std::process::exit(1);
+                        });
+                    std::process::exit(status.code().unwrap_or(1));
+                }
+                Some(_other) => {
+                    eprintln!("[b00t] usage.cli resolved to unexpected dispatch type");
+                    std::process::exit(1);
+                }
+                None => {
+                    eprintln!("[b00t] usage.cli datum not found");
+                    eprintln!("       Install usage: b00t cli install usage.cli");
                     std::process::exit(1);
                 }
             }
@@ -3405,10 +3854,19 @@ mod k0mmand3r_dispatch_tests {
 
         assert_eq!(cli.path, "/tmp/demo");
         match cli.command {
-            Some(Commands::Uninstall { name, yes, purge }) => {
-                assert_eq!(name, "demo-datum");
+            Some(Commands::Uninstall {
+                name,
+                yes,
+                purge,
+                runtimes,
+                scope,
+            }) => {
+                assert_eq!(name.as_deref(), Some("demo-datum"));
                 assert!(yes);
                 assert!(!purge);
+                // Datum-name uninstalls must not silently become runtime uninstalls.
+                assert!(runtimes.is_empty());
+                assert_eq!(scope, "global");
             }
             _ => panic!("expected uninstall command"),
         }
@@ -3692,5 +4150,110 @@ mod k0mmand3r_dispatch_tests {
         );
         // If a datum named "gh" is not in k0mmand_verbs it will not be shadowed.
         assert!(!k0mmand_verbs.contains(&"gh"), "/gh is NOT shadowed");
+    }
+}
+
+#[cfg(test)]
+mod datum_dir_resolution_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    // `resolve_datum_dir`/`path_was_explicit` read the real process cwd and
+    // the real _B00T_Path env var -- serialize these tests so they don't
+    // race each other's env::set_current_dir / env::set_var.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn args(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn path_was_explicit_true_for_long_flag() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("_B00T_Path");
+        }
+        assert!(path_was_explicit(&args(&["b00t-cli", "--path", "/tmp/x"])));
+        assert!(path_was_explicit(&args(&["b00t-cli", "--path=/tmp/x"])));
+    }
+
+    #[test]
+    fn path_was_explicit_true_for_short_flag() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("_B00T_Path");
+        }
+        assert!(path_was_explicit(&args(&["b00t-cli", "-p", "/tmp/x"])));
+    }
+
+    #[test]
+    fn path_was_explicit_true_for_env_var() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var("_B00T_Path", "/tmp/x");
+        }
+        assert!(path_was_explicit(&args(&["b00t-cli", "whoami"])));
+        unsafe {
+            std::env::remove_var("_B00T_Path");
+        }
+    }
+
+    #[test]
+    fn path_was_explicit_false_with_nothing_set() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("_B00T_Path");
+        }
+        assert!(!path_was_explicit(&args(&["b00t-cli", "whoami"])));
+    }
+
+    #[test]
+    fn resolve_datum_dir_respects_explicit_override() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        // explicit=true short-circuits before touching cwd/git at all --
+        // no need to fake a repo for this case.
+        assert_eq!(
+            resolve_datum_dir("/explicit/path", true),
+            "/explicit/path"
+        );
+    }
+
+    #[test]
+    fn resolve_datum_dir_finds_project_local_b00t_dir() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        std::fs::create_dir(dir.path().join("_b00t_")).unwrap();
+
+        let original_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+
+        let resolved = resolve_datum_dir("~/.dotfiles/_b00t_", false);
+
+        std::env::set_current_dir(original_cwd).unwrap();
+
+        let expected = dir.path().join("_b00t_");
+        assert_eq!(
+            std::fs::canonicalize(&resolved).unwrap(),
+            std::fs::canonicalize(&expected).unwrap(),
+            "expected project-local _b00t_/ to win over the global fallback (#866)"
+        );
+    }
+
+    #[test]
+    fn resolve_datum_dir_falls_back_when_no_project_local_dir() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        // deliberately no _b00t_/ subdirectory
+
+        let original_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+
+        let resolved = resolve_datum_dir("~/.dotfiles/_b00t_", false);
+
+        std::env::set_current_dir(original_cwd).unwrap();
+
+        assert_eq!(resolved, "~/.dotfiles/_b00t_");
     }
 }

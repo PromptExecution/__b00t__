@@ -125,8 +125,16 @@ if [ -f ~/.env ]; then
         [[ "$line" =~ ^#.*$ || -z "$line" ]] && continue
 
         # Validate KEY=VALUE format
-        if [[ "$line" =~ ^[^=]+=[^=]+$ ]]; then
-            export "$line"
+        if [[ "$line" =~ ^([^=]+)=(.*)$ ]]; then
+            key="${BASH_REMATCH[1]}"
+            value="${BASH_REMATCH[2]}"
+            # Strip one matching pair of surrounding quotes, if present
+            if [[ "$value" =~ ^\"(.*)\"$ ]]; then
+                value="${BASH_REMATCH[1]}"
+            elif [[ "$value" =~ ^\'(.*)\'$ ]]; then
+                value="${BASH_REMATCH[1]}"
+            fi
+            export "$key=$value"
         else
             echo "Invalid line in .env: $line"
         fi
@@ -217,6 +225,10 @@ if [[ $- == *i* ]]; then
 fi
 
 
+# 🦨 PR #1180 originally deleted this block as "unused" -- it isn't: main
+# independently hardened it (added the `[[ $- == *i* ]]` interactive-shell
+# guard) after this branch diverged, proving it's still live/maintained.
+# Kept as-is; not this PR's concern to touch.
 # detect podman
 if command -v podman &> /dev/null; then
     ## echo "✅🐳 podman"
@@ -396,10 +408,6 @@ fi
 
 # TODO: check if go is installed
 export PATH=$PATH:/usr/local/go/bin
-
-#if [ -d ~/.krew ] ; then
-#    export PATH="${KREW_ROOT:-$HOME/.krew}/bin:$PATH"
-#fi
 
 alias gemini='npx -y https://github.com/google-gemini/gemini-cli'
 

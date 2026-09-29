@@ -2,11 +2,12 @@ use std::collections::HashSet;
 use std::sync::OnceLock;
 
 use serde::{Deserialize, Deserializer, Serialize};
+use ufo_types::{Stereotyped, UfoStereotype};
 
 use crate::{
-    ComposeConfig, DatumType, GateSpec, InstallSpec, JustfileConfig, K0mmand3rDatumConfig,
-    KnowledgeConfig, LearnMeta, MaintenanceConfig, McpMethods, OrchestrationConfig, PipelineConfig,
-    PolysemeConfig, RuntimeConfig, UsageExample,
+    AiProvisionConfig, ComposeConfig, DatumType, GateSpec, InstallSpec, JustfileConfig,
+    K0mmand3rDatumConfig, KnowledgeConfig, LearnMeta, MaintenanceConfig, McpMethods,
+    OrchestrationConfig, PipelineConfig, PolysemeConfig, RuntimeConfig, UsageExample,
 };
 
 // warn-once registry — one warning per unknown datum type string per process
@@ -32,6 +33,8 @@ fn is_known_content_tag(s: &str) -> bool {
             | "ai_provider"
             | "pyinfra"
             | "wow"
+            | "lfmf"
+            | "capability"
     )
 }
 
@@ -180,6 +183,11 @@ pub struct BootDatum {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mcp: Option<McpMethods>,
 
+    // Generic AI-backend credential provisioning (b00t-server key minting +
+    // env injection at MCP-install time) — see AiProvisionConfig doc comment.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ai_provision: Option<AiProvisionConfig>,
+
     // Gate preconditions
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate: Option<Vec<GateSpec>>,
@@ -207,6 +215,28 @@ pub struct BootDatum {
     // Dependency graph
     pub depends_on: Option<Vec<String>>,
     pub members: Option<Vec<String>>,
+
+    // #1345: External references (ReqIF requirements, specs, standards).
+    // TOML: `[b00t] satisfies = ["reqif://...#REQ-001"]`
+    // Relationship verbs are fixed and enumerable (ufo_types::RefRelationship).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub satisfies: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub constrains: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conflicts_with: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub verifies: Vec<String>,
+
+    /// Payload of a `DatumType::AgentProfile` (`.agentprofile.toml`) — the
+    /// signed r0le package. `[b00t.agent_profile]` in the datum file.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_profile: Option<crate::datum_agent_profile::AgentProfileSpec>,
+
+    /// Payload of a `DatumType::McpServer` (`.mcp_server.toml`) — the on-demand
+    /// launch spec for a remote MCP server (SP4). `[b00t.mcp_server]`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp_server: Option<crate::datum_mcp_server::McpServerSpec>,
 
     // Classifier hints
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -273,12 +303,48 @@ pub struct BootDatum {
     //     Remove after all datums have been audited.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub required_for_core: Option<bool>,
+
+    // #163 Postel loader tolerance: raw TOML source parked when strict parse
+    // fails and the datum loads via the lenient fallback path. In-memory only.
+    #[serde(skip)]
+    pub raw_source: Option<String>,
 }
 
 // Re-export ApiProvides from config_types (needed by BootDatum)
 use crate::ApiProvides;
 
 impl BootDatum {
+    /// Collect all external references (ReqIF requirements, specs, standards).
+    ///
+    /// Returns `Vec<ExternalRef>` by mapping each relationship verb's URI list
+    /// through `ufo_types::Uri::parse`. Relationship verbs are fixed and
+    /// enumerable per `ufo_types::RefRelationship`.
+    pub fn external_refs(&self) -> Vec<crate::external_refs::ExternalRef> {
+        use crate::external_refs::{ExternalRef, RefRelationship, Uri};
+
+        let mut refs = Vec::new();
+        for (verb, uris) in [
+            (RefRelationship::Satisfies, &self.satisfies),
+            (RefRelationship::Constrains, &self.constrains),
+            (RefRelationship::ConflictsWith, &self.conflicts_with),
+            (RefRelationship::Verifies, &self.verifies),
+        ] {
+            for uri_str in uris.iter() {
+                refs.push(ExternalRef::new(verb, Uri::parse(uri_str)));
+            }
+        }
+        // depends_on already exists as a separate field — include it as DependsOn refs
+        if let Some(ref deps) = self.depends_on {
+            for dep in deps {
+                refs.push(ExternalRef::new(
+                    RefRelationship::DependsOn,
+                    Uri::parse(dep),
+                ));
+            }
+        }
+        refs
+    }
+
     /// Type identity string: `{type_prefix}_{name}`.
     ///
     /// Deterministic — same name + same DatumType always produces the same ID.
@@ -306,5 +372,220 @@ impl BootDatum {
 
     pub fn install_command_string(&self) -> Option<String> {
         self.install.as_ref().and_then(InstallSpec::command_string)
+    }
+}
+
+impl Stereotyped for BootDatum {
+    /// Delegates to `DatumType`'s lattice (#925) — this impl declares no
+    /// mapping of its own. Missing/unrecognized type degrades to
+    /// `Kind("Unknown")` — never panics, per Postel's Law (CLAUDE.md:
+    /// "be liberal in what you accept"). BootDatum is an open struct; the
+    /// stereotype is derived from the *declared* type, never field presence.
+    fn ufo_stereotype(&self) -> UfoStereotype {
+        self.datum_type
+            .map(|dt| dt.ufo_stereotype())
+            .unwrap_or_else(|| UfoStereotype::Kind("Unknown".into()))
+    }
+}
+
+/// Scans `dir` (non-recursive) for datum files and loads them into a
+/// `{name}.{type_prefix}` -> `BootDatum` map. The single shared
+/// implementation of the scan itself for `install`/`uninstall`/`stack`/
+/// `cli` — previously each of those four commands hand-rolled its own
+/// near-identical copy, which had silently drifted: three copies derived
+/// the type-name key via `Debug`+lowercase (wrong for multi-word variants —
+/// `HiveProfile` became `"hiveprofile"`, not matching any real file's
+/// `.hive` suffix convention) while a fourth used an ad-hoc serde-snake_case
+/// guess (also wrong: `"hive_profile"`, still not `.hive`).
+/// `DatumType::type_prefix()` is the actual documented single source of
+/// truth (auto-derived from the same `datum_type_table!` macro that defines
+/// each type's real file suffix), so it's the only correct choice here.
+///
+/// Recognizes `.toml`, `.tomllm`, and `.tomllmd` as datum file extensions —
+/// all three are real, currently-used extensions in this repo (e.g.
+/// `_b00t_/datums/*.tomllmd`); a plain `.ends_with(".toml")` check silently
+/// excludes the latter two, since `"foo.tomllmd"` does not end with the
+/// literal substring `".toml"`.
+///
+/// Deliberately takes an already-resolved `&Path`, not a raw path string —
+/// the four callers resolved their base directory differently before this
+/// consolidation (three used plain tilde expansion; `stack.rs` used
+/// `lifecycle::get_expanded_path`'s legacy-directory fallback), and that
+/// divergence predates this function and is each caller's own concern, not
+/// this scan's. Centralizing path resolution too would have silently
+/// changed behavior for whichever callers didn't already use the
+/// fallback-aware version.
+pub fn load_all_datums_from_dir(
+    dir: &std::path::Path,
+) -> anyhow::Result<std::collections::HashMap<String, BootDatum>> {
+    let mut datums = std::collections::HashMap::new();
+
+    if !dir.exists() {
+        return Ok(datums);
+    }
+
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let entry_path = entry.path();
+
+        if !entry_path.is_file() {
+            continue;
+        }
+        let Some(file_name) = entry_path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if file_name.ends_with(".stack.toml") {
+            continue;
+        }
+        if !(file_name.ends_with(".toml")
+            || file_name.ends_with(".tomllm")
+            || file_name.ends_with(".tomllmd"))
+        {
+            continue;
+        }
+
+        let Ok(content) = std::fs::read_to_string(&entry_path) else {
+            continue;
+        };
+        let Ok(config) = toml::from_str::<crate::UnifiedConfig>(&content) else {
+            continue;
+        };
+        let datum = config.b00t;
+        let type_prefix = datum
+            .datum_type
+            .as_ref()
+            .map(|t| t.type_prefix().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        let key = format!("{}.{}", datum.name, type_prefix);
+        datums.insert(key, datum);
+    }
+
+    Ok(datums)
+}
+
+/// Convenience wrapper matching the original (pre-consolidation) simple
+/// tilde-expansion path resolution used by `install`/`uninstall`/`cli` —
+/// same behavior those three callers already had. `stack.rs` does NOT use
+/// this; it resolves via `lifecycle::get_expanded_path` (legacy-fallback
+/// aware) and calls `load_all_datums_from_dir` directly, preserving its own
+/// pre-existing behavior exactly.
+pub fn load_all_datums(path: &str) -> anyhow::Result<std::collections::HashMap<String, BootDatum>> {
+    let dir = std::path::PathBuf::from(shellexpand::tilde(path).to_string());
+    load_all_datums_from_dir(&dir)
+}
+
+#[cfg(test)]
+mod load_all_datums_tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    #[test]
+    fn finds_toml_tomllm_and_tomllmd_extensions() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().to_str().unwrap();
+
+        fs::write(
+            temp_dir.path().join("alpha.cli.toml"),
+            "[b00t]\nname = \"alpha\"\ntype = \"cli\"\nhint = \"t\"\n",
+        )
+        .unwrap();
+        fs::write(
+            temp_dir.path().join("bravo.cli.tomllm"),
+            "[b00t]\nname = \"bravo\"\ntype = \"cli\"\nhint = \"t\"\n",
+        )
+        .unwrap();
+        fs::write(
+            temp_dir.path().join("charlie.cli.tomllmd"),
+            "[b00t]\nname = \"charlie\"\ntype = \"cli\"\nhint = \"t\"\n",
+        )
+        .unwrap();
+
+        let datums = load_all_datums(path).unwrap();
+        assert_eq!(
+            datums.len(),
+            3,
+            "expected all three extensions to be found, got: {:?}",
+            datums.keys().collect::<Vec<_>>()
+        );
+        assert!(datums.contains_key("alpha.cli"));
+        assert!(datums.contains_key("bravo.cli"));
+        assert!(datums.contains_key("charlie.cli"));
+    }
+
+    #[test]
+    fn uses_type_prefix_not_debug_lowercase_for_multiword_types() {
+        // Regression test for the pre-consolidation divergence: HiveProfile's
+        // real file-suffix convention is `.hive` (type_prefix()), not
+        // Debug+lowercase's "hiveprofile" or an ad-hoc "hive_profile" guess.
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().to_str().unwrap();
+
+        fs::write(
+            temp_dir.path().join("mesh3d-batch.hive.toml"),
+            "[b00t]\nname = \"mesh3d-batch\"\ntype = \"hive_profile\"\nhint = \"t\"\n",
+        )
+        .unwrap();
+
+        let datums = load_all_datums(path).unwrap();
+        assert!(
+            datums.contains_key("mesh3d-batch.hive"),
+            "expected key using type_prefix() ('hive'), got: {:?}",
+            datums.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn skips_stack_toml_files() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().to_str().unwrap();
+
+        fs::write(
+            temp_dir.path().join("mystack.stack.toml"),
+            "[b00t]\nname = \"mystack\"\ntype = \"stack\"\nhint = \"t\"\n",
+        )
+        .unwrap();
+
+        let datums = load_all_datums(path).unwrap();
+        assert_eq!(datums.len(), 0);
+    }
+
+    #[test]
+    fn empty_directory_returns_empty_map() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().to_str().unwrap();
+        let datums = load_all_datums(path).unwrap();
+        assert_eq!(datums.len(), 0);
+    }
+}
+
+#[cfg(test)]
+mod stereotype_tests {
+    use super::*;
+
+    #[test]
+    fn stereotype_degrades_to_unknown_for_untyped_datum() {
+        let d = BootDatum {
+            name: "synthetic".into(),
+            datum_type: None,
+            ..Default::default()
+        };
+        assert_eq!(d.ufo_stereotype(), UfoStereotype::Kind("Unknown".into()));
+    }
+
+    #[test]
+    fn stereotype_delegates_to_datum_type() {
+        let d = BootDatum {
+            name: "x".into(),
+            datum_type: Some(DatumType::Docker),
+            ..Default::default()
+        };
+        assert_eq!(
+            d.ufo_stereotype(),
+            UfoStereotype::SubKind {
+                name: "Docker".into(),
+                parent: "ContainerRuntime".into()
+            }
+        );
     }
 }

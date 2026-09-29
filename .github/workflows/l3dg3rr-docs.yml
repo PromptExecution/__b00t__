@@ -41,7 +41,9 @@ jobs:
           submodules: false
 
       - name: Initialize workspace submodule deps
-        run: git submodule update --init --depth 1 vendor/embed-anything-b00t vendor/ledgrrr vendor/runpod-sdk
+        run: |
+          git submodule update --init --depth 1 vendor/embed-anything-b00t vendor/runpod-sdk vendor/b00tyverse
+          git -C vendor/b00tyverse submodule update --init --depth 1 ledgrrr
 
       - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@stable

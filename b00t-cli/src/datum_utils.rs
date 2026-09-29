@@ -11,7 +11,28 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+/// #1308: Resolve the real base directory for relative paths inside a datum.
+///
+/// When a datum file is a symlink (e.g. `_b00t_/foo.just.toml` →
+/// `../vendor/_b00t_/foo.just.toml`), relative paths declared inside
+/// the datum should resolve against the **real** file's parent directory,
+/// not the symlink's directory.
+///
+/// Returns the canonical parent directory of `store_dir/filename`
+/// when the file is a symlink, otherwise returns `store_dir` as-is.
+pub fn resolve_datum_base_dir(store_dir: &str, filename: &str) -> PathBuf {
+    let datum_path = Path::new(store_dir).join(filename);
+    if datum_path.is_symlink() {
+        if let Ok(canonical) = std::fs::canonicalize(&datum_path) {
+            if let Some(parent) = canonical.parent() {
+                return parent.to_path_buf();
+            }
+        }
+    }
+    PathBuf::from(store_dir)
+}
 
 /// Maximum recursion depth for datum discovery
 const DEFAULT_MAX_DEPTH: usize = 10;
@@ -119,18 +140,78 @@ pub fn get_all_datums_with_paths(
     b00t_path: &str,
     max_depth: Option<usize>,
 ) -> Result<HashMap<String, (BootDatum, String)>> {
+    let (datums, _diag) = get_all_datums_with_diagnostics(b00t_path, max_depth)?;
+    Ok(datums)
+}
+
+/// Tenant-namespaced datum scan (SP2-06 / F6).
+///
+/// Scans the base `_b00t_` tree, then — when `tenant` is `Some` — overlays
+/// `<b00t_path>/tenants/<tenant>/_b00t_` on top. The overlay always wins on a
+/// key collision; isolation is structural (one tenant per call, disjoint scan
+/// roots). Emitted keys are identical to [`get_all_datums_with_paths`] so
+/// downstream callers stay tenant-agnostic. `tenant == None` is byte-identical
+/// to [`get_all_datums_with_paths`].
+pub fn get_all_datums_for_tenant(
+    b00t_path: &str,
+    tenant: Option<&str>,
+    max_depth: Option<usize>,
+) -> Result<HashMap<String, (BootDatum, String)>> {
+    let mut datums = get_all_datums_with_paths(b00t_path, max_depth)?;
+    if let Some(t) = tenant {
+        if t.is_empty() || t.contains('/') || t.contains('\\') || t == "." || t == ".." {
+            anyhow::bail!("invalid tenant id: {t:?}");
+        }
+        // The overlay lives BESIDE the base `_b00t_` dir (`<parent>/tenants/<t>/_b00t_`),
+        // never inside it — a nested `tenants/` subtree would be double-counted by
+        // the recursive base scan and defeat isolation (F6).
+        let expanded = shellexpand::tilde(b00t_path).into_owned();
+        if let Some(overlay_root) = Path::new(&expanded)
+            .parent()
+            .map(|p| p.join("tenants").join(t).join("_b00t_"))
+        {
+            if overlay_root.is_dir() {
+                let overlay_str = overlay_root.to_string_lossy().into_owned();
+                for (k, v) in get_all_datums_with_paths(&overlay_str, max_depth)? {
+                    datums.insert(k, v); // overlay wins
+                }
+            }
+        }
+    }
+    Ok(datums)
+}
+
+/// Scan-level diagnostics (#163): degraded (lenient-fallback) files + key shadowing.
+/// Postel's Law: the loader is tolerant — nothing vanishes silently.
+#[derive(Debug, Default, Clone)]
+pub struct ScanDiagnostics {
+    /// Files that failed strict `UnifiedConfig` parse (or were unreadable) and
+    /// loaded via the lenient fallback path instead: (file path, one-line reason).
+    pub degraded: Vec<(String, String)>,
+    /// Same datum key claimed by multiple files: (key, shadowed path, winning path).
+    /// Precedence: .tomllmd > .tomllm > .toml; equal rank — later scan wins.
+    /// A good parse always beats a degraded fallback, regardless of rank.
+    pub shadowed: Vec<(String, String, String)>,
+}
+
+/// Like `get_all_datums_with_paths` but also returns scan diagnostics (#163).
+pub fn get_all_datums_with_diagnostics(
+    b00t_path: &str,
+    max_depth: Option<usize>,
+) -> Result<(HashMap<String, (BootDatum, String)>, ScanDiagnostics)> {
     let expanded_path = shellexpand::tilde(b00t_path);
     let path = Path::new(expanded_path.as_ref());
     let mut datums = HashMap::new();
+    let mut diag = ScanDiagnostics::default();
 
     if !path.exists() {
-        return Ok(datums);
+        return Ok((datums, diag));
     }
 
     let depth = max_depth.unwrap_or(DEFAULT_MAX_DEPTH);
-    scan_datums_recursive(path, &mut datums, 0, depth)?;
+    scan_datums_recursive(path, &mut datums, &mut diag, 0, depth)?;
 
-    Ok(datums)
+    Ok((datums, diag))
 }
 
 /// Merge `b00t.*` Git attributes into a parsed datum without mutating the datum file.
@@ -262,6 +343,7 @@ fn find_git_worktree_root(path: &Path) -> Option<std::path::PathBuf> {
 fn scan_datums_recursive(
     dir: &Path,
     datums: &mut HashMap<String, (BootDatum, String)>,
+    diag: &mut ScanDiagnostics,
     current_depth: usize,
     max_depth: usize,
 ) -> Result<()> {
@@ -283,7 +365,7 @@ fn scan_datums_recursive(
 
         if entry_path.is_dir() {
             // Recurse into subdirectories
-            scan_datums_recursive(&entry_path, datums, current_depth + 1, max_depth)?;
+            scan_datums_recursive(&entry_path, datums, diag, current_depth + 1, max_depth)?;
         } else if matches!(
             entry_path.extension().and_then(|s| s.to_str()),
             Some("toml") | Some("tomllm") | Some("tomllmd") // 🤓 .tomllmd currently downgrades to the generic .tomllm parser path
@@ -297,42 +379,88 @@ fn scan_datums_recursive(
                     continue;
                 }
 
-                // Try to parse as unified config
-                if let Ok(content) = fs::read_to_string(&entry_path) {
-                    if let Ok(mut config) = toml::from_str::<UnifiedConfig>(&content) {
-                        apply_git_attributes_to_config(&mut config, &entry_path);
-                        // Strip outer extension (.tomllmd / .tomllm / .toml) for datum key.
-                        // 🤓 precedence: .tomllmd > .tomllm > .toml.
-                        let ext = if filename.ends_with(".tomllmd") {
-                            ".tomllmd"
-                        } else if filename.ends_with(".tomllm") {
-                            ".tomllm"
-                        } else {
-                            ".toml"
-                        };
-                        let datum_key = filename.trim_end_matches(ext).to_string();
-                        let path_str = entry_path.to_string_lossy().to_string();
-                        let new_rank = match ext {
-                            ".tomllmd" => 3,
-                            ".tomllm" => 2,
-                            _ => 1,
-                        };
-                        let current_rank = datums
-                            .get(&datum_key)
-                            .map(|(_, existing_path)| {
-                                if existing_path.ends_with(".tomllmd") {
-                                    3
-                                } else if existing_path.ends_with(".tomllm") {
-                                    2
-                                } else {
-                                    1
-                                }
-                            })
-                            .unwrap_or(0);
-                        if new_rank >= current_rank {
-                            datums.insert(datum_key, (config.b00t, path_str));
+                // Tolerant parse (Postel #163): strict parse first; on failure the
+                // datum still loads via lenient fallback — key from filename, raw
+                // TOML parked, marked degraded. Nothing vanishes silently.
+                let path_str = entry_path.to_string_lossy().to_string();
+                let ext = if filename.ends_with(".tomllmd") {
+                    ".tomllmd"
+                } else if filename.ends_with(".tomllm") {
+                    ".tomllm"
+                } else {
+                    ".toml"
+                };
+                let datum_key = filename.trim_end_matches(ext).to_string();
+                // 🤓 precedence: .tomllmd > .tomllm > .toml.
+                let new_rank = match ext {
+                    ".tomllmd" => 3,
+                    ".tomllm" => 2,
+                    _ => 1,
+                };
+
+                let parsed: Result<BootDatum, String> = match fs::read_to_string(&entry_path) {
+                    Err(e) => Err(format!("unreadable: {e}")),
+                    Ok(content) => match toml::from_str::<UnifiedConfig>(&content) {
+                        Ok(mut config) => {
+                            apply_git_attributes_to_config(&mut config, &entry_path);
+                            Ok(config.b00t)
                         }
+                        Err(e) => {
+                            let one_line = e
+                                .to_string()
+                                .lines()
+                                .map(str::trim)
+                                .filter(|l| !l.is_empty())
+                                .collect::<Vec<_>>()
+                                .join("; ");
+                            let mut fallback = BootDatum::default();
+                            fallback.name = datum_key
+                                .split('.')
+                                .next()
+                                .unwrap_or(&datum_key)
+                                .to_string();
+                            fallback.hint = format!("degraded: {filename} failed strict parse");
+                            fallback.status = Some("degraded".to_string());
+                            fallback.status_msg = Some(one_line.clone());
+                            fallback.type_tags = Some(vec!["degraded".to_string()]);
+                            fallback.raw_source = Some(content);
+                            diag.degraded.push((path_str.clone(), one_line));
+                            datums.entry(datum_key.clone()).or_insert((fallback, path_str.clone()));
+                            continue; // degraded never displaces an existing entry
+                        }
+                    },
+                };
+                let datum = match parsed {
+                    Ok(d) => d,
+                    Err(reason) => {
+                        diag.degraded.push((path_str, reason));
+                        continue;
                     }
+                };
+
+                let existing = datums.get(&datum_key).map(|(d, existing_path)| {
+                    let rank = if existing_path.ends_with(".tomllmd") {
+                        3
+                    } else if existing_path.ends_with(".tomllm") {
+                        2
+                    } else {
+                        1
+                    };
+                    (rank, existing_path.clone(), d.status.as_deref() == Some("degraded"))
+                });
+                let current_rank = match &existing {
+                    // a good parse always beats a degraded fallback
+                    Some((_, _, true)) => 0,
+                    Some((rank, _, false)) => *rank,
+                    None => 0,
+                };
+                if new_rank >= current_rank {
+                    if let Some((_, old_path, _)) = existing {
+                        diag.shadowed.push((datum_key.clone(), old_path, path_str.clone()));
+                    }
+                    datums.insert(datum_key, (datum, path_str));
+                } else if let Some((_, winning_path, _)) = existing {
+                    diag.shadowed.push((datum_key, path_str, winning_path));
                 }
             }
         }
@@ -366,19 +494,58 @@ pub fn find_datum_by_pattern(b00t_path: &str, pattern: &str) -> Result<Option<Bo
         return Ok(Some(datum.clone()));
     }
 
-    // Try name or lfmf_category match in single pass
-    for (_, datum) in datums.iter() {
+    // 🤓 Several datums may share a `name` — that is exactly what a polyseme is
+    //    for (e.g. pi.agent + pi.polyseme both carry name = "pi"). Returning the
+    //    first HashMap hit made `b00t datum show <name>` nondeterministic across
+    //    runs (observed: Polyseme/Agent/Polyseme on three consecutive calls).
+    //    Rank instead, mirroring install_datum()'s "prefer installable" rule.
+    let mut name_matches: Vec<(String, BootDatum)> = Vec::new();
+    let mut category_matches: Vec<(String, BootDatum)> = Vec::new();
+    for (key, datum) in datums.into_iter() {
         if datum.name == pattern {
-            return Ok(Some(datum.clone()));
-        }
-        if let Some(category) = &datum.lfmf_category {
-            if category == pattern {
-                return Ok(Some(datum.clone()));
-            }
+            name_matches.push((key, datum));
+        } else if datum.lfmf_category.as_deref() == Some(pattern) {
+            category_matches.push((key, datum));
         }
     }
 
-    Ok(None)
+    // A name is more specific than an lfmf_category, so name matches win.
+    let mut matches = if name_matches.is_empty() {
+        category_matches
+    } else {
+        name_matches
+    };
+    if matches.is_empty() {
+        return Ok(None);
+    }
+
+    // Rank so the pick is deterministic and meaningful. Lower sorts first:
+    //   1. live datums before deregistered ones — `enabled = false` or
+    //      `status = "sunset"` (set inline or via _b00t_/.gitattributes) must
+    //      actually affect resolution, otherwise deregistration is decorative
+    //      and a sunset datum can shadow its own live replacement.
+    //   2. polyseme before a concrete facet — a polyseme is the disambiguation
+    //      index for a shared name, so it is the right discovery answer.
+    //   3. key, so any remaining tie is reproducible instead of HashMap-ordered.
+    fn rank(datum: &BootDatum) -> (u8, u8) {
+        let deregistered = if datum.enabled == Some(false)
+            || datum.status.as_deref() == Some("sunset")
+            || datum.status.as_deref() == Some("deprecated")
+        {
+            1
+        } else {
+            0
+        };
+        let facet = if matches!(datum.datum_type, Some(crate::DatumType::Polyseme)) {
+            0
+        } else {
+            1
+        };
+        (deregistered, facet)
+    }
+    matches.sort_by(|a, b| rank(&a.1).cmp(&rank(&b.1)).then_with(|| a.0.cmp(&b.0)));
+
+    Ok(matches.into_iter().next().map(|(_, datum)| datum))
 }
 
 /// Get all datums that have a specific LFMF category
@@ -773,6 +940,83 @@ mod tests {
 
     fn create_test_datum_file(dir: &std::path::Path, name: &str, content: &str) {
         fs::write(dir.join(name), content).unwrap();
+    }
+
+    // ── #163: scan diagnostics — skipped (unparseable) + shadowed files ──────
+
+    #[test]
+    fn scan_degrades_unparseable_file_instead_of_dropping_it() {
+        let temp_dir = TempDir::new().unwrap();
+        create_test_datum_file(
+            temp_dir.path(),
+            "good.cli.toml",
+            "[b00t]\nname = \"good\"\ntype = \"cli\"\nhint = \"ok\"\n",
+        );
+        let raw = "[b00t]\nname = \"broken\"\nthis is not = valid toml [[[\n";
+        create_test_datum_file(temp_dir.path(), "broken.cli.toml", raw);
+        let (datums, diag) =
+            get_all_datums_with_diagnostics(temp_dir.path().to_str().unwrap(), Some(0)).unwrap();
+        // Postel: the broken file MUST NOT vanish — it loads as a degraded datum.
+        assert_eq!(datums.len(), 2, "degraded datum still loads");
+        let (degraded, path) = &datums["broken.cli"];
+        assert!(path.ends_with("broken.cli.toml"));
+        assert_eq!(degraded.name, "broken", "name captured from filename");
+        assert_eq!(degraded.status.as_deref(), Some("degraded"));
+        assert_eq!(degraded.raw_source.as_deref(), Some(raw), "raw TOML parked");
+        assert!(degraded.status_msg.as_deref().unwrap_or("").contains("TOML parse error"));
+        // and the parse problem is surfaced in scan diagnostics
+        assert_eq!(diag.degraded.len(), 1, "degraded file reported");
+        let (dpath, reason) = &diag.degraded[0];
+        assert!(dpath.ends_with("broken.cli.toml"), "degraded path: {dpath}");
+        assert!(!reason.is_empty() && !reason.contains('\n'), "one-line reason: {reason:?}");
+    }
+
+    #[test]
+    fn good_parse_always_beats_degraded_fallback() {
+        // broken .tomllm (higher rank) must NOT shadow a good .toml parse
+        let temp_dir = TempDir::new().unwrap();
+        create_test_datum_file(
+            temp_dir.path(),
+            "solo.role.toml",
+            "[b00t]\nname = \"solo\"\ntype = \"role\"\nhint = \"good toml\"\n",
+        );
+        create_test_datum_file(
+            temp_dir.path(),
+            "solo.role.tomllm",
+            "not even = toml [[[\n",
+        );
+        let (datums, diag) =
+            get_all_datums_with_diagnostics(temp_dir.path().to_str().unwrap(), Some(0)).unwrap();
+        assert_eq!(datums.len(), 1);
+        let (winner, winner_path) = &datums["solo.role"];
+        assert!(winner_path.ends_with("solo.role.toml"), "good parse wins: {winner_path}");
+        assert!(winner.status.is_none(), "winner is not degraded");
+        assert_eq!(diag.degraded.len(), 1, "broken variant still surfaced");
+    }
+
+    #[test]
+    fn scan_diagnostics_reports_shadowed_key() {
+        let temp_dir = TempDir::new().unwrap();
+        create_test_datum_file(
+            temp_dir.path(),
+            "solo.role.toml",
+            "[b00t]\nname = \"solo\"\ntype = \"role\"\nhint = \"toml variant\"\n",
+        );
+        create_test_datum_file(
+            temp_dir.path(),
+            "solo.role.tomllm",
+            "[b00t]\nname = \"solo\"\ntype = \"role\"\nhint = \"tomllm variant\"\n",
+        );
+        let (datums, diag) =
+            get_all_datums_with_diagnostics(temp_dir.path().to_str().unwrap(), Some(0)).unwrap();
+        assert_eq!(datums.len(), 1, "one key survives");
+        let (_, winner_path) = &datums["solo.role"];
+        assert!(winner_path.ends_with("solo.role.tomllm"), ".tomllm outranks .toml");
+        assert_eq!(diag.shadowed.len(), 1, "shadowing reported");
+        let (key, loser, winner) = &diag.shadowed[0];
+        assert_eq!(key, "solo.role");
+        assert!(loser.ends_with("solo.role.toml"), "loser: {loser}");
+        assert!(winner.ends_with("solo.role.tomllm"), "winner: {winner}");
     }
 
     #[test]
@@ -1320,5 +1564,34 @@ output = "Building..."
         let (datum, path) = datums.get("tool.cli").unwrap();
         assert_eq!(datum.name, "tool-tomllm", ".tomllm must win over .toml");
         assert!(path.ends_with(".tomllm"));
+    }
+}
+
+#[cfg(test)]
+mod tenant_overlay_tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn tenant_overlay_shadows_base_and_isolates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("_b00t_");
+        fs::create_dir_all(&base).unwrap();
+        fs::write(base.join("acme.toml"),
+            "[b00t]\nname = \"acme\"\ntype = \"role\"\n").unwrap();
+        // overlay is a SIBLING of the base _b00t_ dir, not nested inside it
+        let over = tmp.path().join("tenants/app4dog/_b00t_");
+        fs::create_dir_all(&over).unwrap();
+        fs::write(over.join("acme.toml"),
+            "[b00t]\nname = \"acme-a4d\"\ntype = \"role\"\n").unwrap();
+
+        let bs = base.to_str().unwrap();
+        assert_eq!(get_all_datums_for_tenant(bs, None, Some(3)).unwrap()
+            .get("acme").unwrap().0.name, "acme");
+        assert_eq!(get_all_datums_for_tenant(bs, Some("app4dog"), Some(3)).unwrap()
+            .get("acme").unwrap().0.name, "acme-a4d");
+        assert_eq!(get_all_datums_for_tenant(bs, Some("promptexecution"), Some(3)).unwrap()
+            .get("acme").unwrap().0.name, "acme");
+        assert!(get_all_datums_for_tenant(bs, Some("../evil"), Some(3)).is_err());
     }
 }

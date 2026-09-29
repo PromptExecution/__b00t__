@@ -26,8 +26,9 @@ use b00t_c0re_lib::soul_dataframerr::{
 use clap::Parser;
 
 use crate::memory_provider::{
-    FileMemory, MemoryProvider, active_soul_path, detect_provider, soul_path,
+    FileMemory, MemoryProvider, detect_provider, soul_path, soul_path_for,
 };
+use crate::soul_scope::{ShardKind, SoulScope};
 use crate::soul_writer::{SoulMemoryWriter, active_soul_dir, global_soul_dir, local_soul_dir};
 
 #[derive(Parser)]
@@ -151,13 +152,24 @@ pub enum SoulCommands {
             help = "Column definitions: 'name:type' or 'name:type?' (nullable). Types: text int float cake bool timestamp token json"
         )]
         columns: Vec<String>,
+        #[clap(
+            long,
+            help = "#1102 shard scope 'kind:id', e.g. 'agent:pi' — kinds: project system agent skill tool datum. Omit for the legacy/default shard."
+        )]
+        scope: Option<String>,
     },
 
     #[clap(
         name = "table-list",
         about = "List all DataFramerr tables in active soul"
     )]
-    TableList,
+    TableList {
+        #[clap(
+            long,
+            help = "#1102 shard scope 'kind:id', e.g. 'agent:pi' — kinds: project system agent skill tool datum. Omit for the legacy/default shard."
+        )]
+        scope: Option<String>,
+    },
 
     #[clap(name = "table-show", about = "Show schema + row count for a table")]
     TableShow { name: String },
@@ -174,29 +186,69 @@ pub enum SoulCommands {
         table: String,
         #[clap(help = "Field values as 'key=value' pairs")]
         fields: Vec<String>,
+        #[clap(
+            long,
+            help = "#1102 shard scope 'kind:id', e.g. 'agent:pi' — kinds: project system agent skill tool datum. Omit for the legacy/default shard."
+        )]
+        scope: Option<String>,
     },
 
     #[clap(name = "frame-get", about = "Fetch a single row by id")]
-    FrameGet { table: String, id: u64 },
+    FrameGet {
+        table: String,
+        id: u64,
+        #[clap(
+            long,
+            help = "#1102 shard scope 'kind:id', e.g. 'agent:pi' — kinds: project system agent skill tool datum. Omit for the legacy/default shard."
+        )]
+        scope: Option<String>,
+    },
 
     #[clap(name = "frame-dump", about = "Dump rows in tabular format")]
     FrameDump {
         table: String,
         #[clap(long, help = "Show only last N rows")]
         last: Option<usize>,
+        #[clap(
+            long,
+            help = "#1102 shard scope 'kind:id', e.g. 'agent:pi' — kinds: project system agent skill tool datum. Omit for the legacy/default shard."
+        )]
+        scope: Option<String>,
     },
 
     #[clap(name = "cursor-create", about = "Create a durable cursor on a table")]
-    CursorCreate { name: String, table: String },
+    CursorCreate {
+        name: String,
+        table: String,
+        #[clap(
+            long,
+            help = "#1102 shard scope 'kind:id', e.g. 'agent:pi' — kinds: project system agent skill tool datum. Omit for the legacy/default shard."
+        )]
+        scope: Option<String>,
+    },
 
     #[clap(
         name = "cursor-next",
         about = "Advance cursor and print next row (exit 1 at EOF)"
     )]
-    CursorNext { name: String },
+    CursorNext {
+        name: String,
+        #[clap(
+            long,
+            help = "#1102 shard scope 'kind:id', e.g. 'agent:pi' — kinds: project system agent skill tool datum. Omit for the legacy/default shard."
+        )]
+        scope: Option<String>,
+    },
 
     #[clap(name = "cursor-reset", about = "Rewind cursor to frame 0")]
-    CursorReset { name: String },
+    CursorReset {
+        name: String,
+        #[clap(
+            long,
+            help = "#1102 shard scope 'kind:id', e.g. 'agent:pi' — kinds: project system agent skill tool datum. Omit for the legacy/default shard."
+        )]
+        scope: Option<String>,
+    },
 
     #[clap(name = "cursor-list", about = "List all cursors and positions")]
     CursorList,
@@ -215,13 +267,25 @@ pub enum SoulCommands {
         aggregate: String,
         #[clap(long, help = "Event name to emit when alarm fires")]
         emit: String,
+        #[clap(
+            long,
+            help = "#1102 shard scope 'kind:id', e.g. 'agent:pi' — kinds: project system agent skill tool datum. Omit for the legacy/default shard."
+        )]
+        scope: Option<String>,
     },
 
     #[clap(
         name = "alarm-check",
         about = "Evaluate all alarms on a table; print fired events"
     )]
-    AlarmCheck { table: String },
+    AlarmCheck {
+        table: String,
+        #[clap(
+            long,
+            help = "#1102 shard scope 'kind:id', e.g. 'agent:pi' — kinds: project system agent skill tool datum. Omit for the legacy/default shard."
+        )]
+        scope: Option<String>,
+    },
 
     #[clap(name = "alarm-list", about = "List all registered alarms")]
     AlarmList,
@@ -245,6 +309,52 @@ pub enum SoulCommands {
         #[clap(long, default_value = "", help = "Context key used during encode")]
         context: String,
     },
+
+    // ── #1102 shard management ──────────────────────────────────────────────
+    #[clap(
+        name = "shard-list",
+        about = "List known #1102 soul shards (project/system/agent/skill/tool/datum) that have on-disk data"
+    )]
+    ShardList,
+
+    #[clap(
+        name = "shard-export",
+        about = "Print a shard's full TOML document to stdout"
+    )]
+    ShardExport {
+        #[clap(help = "'<kind>:<id>', e.g. 'agent:pi'")]
+        scope: String,
+    },
+
+    #[clap(
+        name = "shard-delete",
+        about = "Delete a shard's on-disk data (irreversible)"
+    )]
+    ShardDelete {
+        #[clap(help = "'<kind>:<id>', e.g. 'agent:pi'")]
+        scope: String,
+    },
+}
+
+fn block_on_soul_future<T>(
+    future: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => tokio::task::block_in_place(|| handle.block_on(future)),
+        Err(_) => tokio::runtime::Runtime::new()?.block_on(future),
+    }
+}
+
+#[cfg(test)]
+mod runtime_tests {
+    use super::block_on_soul_future;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reuses_the_active_runtime_without_panicking() {
+        let result = block_on_soul_future(async { Ok::<_, anyhow::Error>(42_u8) }).unwrap();
+
+        assert_eq!(result, 42);
+    }
 }
 
 pub fn handle_soul_command(cmd: &SoulCommands) -> Result<()> {
@@ -331,8 +441,7 @@ pub fn handle_soul_command(cmd: &SoulCommands) -> Result<()> {
         }
 
         SoulCommands::Serve { port, host } => {
-            let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(serve_soul_kv(host, *port))
+            block_on_soul_future(serve_soul_kv(host, *port))
         }
 
         #[cfg(feature = "dbus")]
@@ -350,8 +459,7 @@ pub fn handle_soul_command(cmd: &SoulCommands) -> Result<()> {
             base_url,
             dry_run,
         } => {
-            let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(distill_soul(model, base_url.as_deref(), *dry_run))
+            block_on_soul_future(distill_soul(model, base_url.as_deref(), *dry_run))
         }
 
         SoulCommands::Init { path: init_path } => {
@@ -383,18 +491,32 @@ pub fn handle_soul_command(cmd: &SoulCommands) -> Result<()> {
         ),
 
         // ── DataFramerr ───────────────────────────────────────────────────────
-        SoulCommands::TableCreate { name, columns } => df_table_create(name, columns),
-        SoulCommands::TableList => df_table_list(),
+        SoulCommands::TableCreate {
+            name,
+            columns,
+            scope,
+        } => df_table_create(name, columns, parse_scope(scope)?),
+        SoulCommands::TableList { scope } => df_table_list(parse_scope(scope)?),
         SoulCommands::TableShow { name } => df_table_show(name),
         SoulCommands::TableDrop { name } => df_table_drop(name),
 
-        SoulCommands::FrameInsert { table, fields } => df_frame_insert(table, fields),
-        SoulCommands::FrameGet { table, id } => df_frame_get(table, *id),
-        SoulCommands::FrameDump { table, last } => df_frame_dump(table, *last),
+        SoulCommands::FrameInsert {
+            table,
+            fields,
+            scope,
+        } => df_frame_insert(table, fields, parse_scope(scope)?),
+        SoulCommands::FrameGet { table, id, scope } => {
+            df_frame_get(table, *id, parse_scope(scope)?)
+        }
+        SoulCommands::FrameDump { table, last, scope } => {
+            df_frame_dump(table, *last, parse_scope(scope)?)
+        }
 
-        SoulCommands::CursorCreate { name, table } => df_cursor_create(name, table),
-        SoulCommands::CursorNext { name } => df_cursor_next(name),
-        SoulCommands::CursorReset { name } => df_cursor_reset(name),
+        SoulCommands::CursorCreate { name, table, scope } => {
+            df_cursor_create(name, table, parse_scope(scope)?)
+        }
+        SoulCommands::CursorNext { name, scope } => df_cursor_next(name, parse_scope(scope)?),
+        SoulCommands::CursorReset { name, scope } => df_cursor_reset(name, parse_scope(scope)?),
         SoulCommands::CursorList => df_cursor_list(),
 
         SoulCommands::AlarmSet {
@@ -404,13 +526,26 @@ pub fn handle_soul_command(cmd: &SoulCommands) -> Result<()> {
             condition,
             aggregate,
             emit,
-        } => df_alarm_set(name, table, column, condition, aggregate, emit),
-        SoulCommands::AlarmCheck { table } => df_alarm_check(table),
+            scope,
+        } => df_alarm_set(
+            name,
+            table,
+            column,
+            condition,
+            aggregate,
+            emit,
+            parse_scope(scope)?,
+        ),
+        SoulCommands::AlarmCheck { table, scope } => df_alarm_check(table, parse_scope(scope)?),
         SoulCommands::AlarmList => df_alarm_list(),
         SoulCommands::AlarmRm { name } => df_alarm_rm(name),
 
         SoulCommands::TokenEncode { plaintext, context } => df_token_encode(plaintext, context),
         SoulCommands::TokenDecode { token, context } => df_token_decode(token, context),
+
+        SoulCommands::ShardList => df_shard_list(),
+        SoulCommands::ShardExport { scope } => df_shard_export(&SoulScope::parse_flag(scope)?),
+        SoulCommands::ShardDelete { scope } => df_shard_delete(&SoulScope::parse_flag(scope)?),
     }
 }
 
@@ -608,7 +743,11 @@ async fn serve_dbus(session: bool, datum_dir: std::path::PathBuf) -> Result<()> 
 // ─── soul init ────────────────────────────────────────────────────────────────
 
 /// Create `._b00t_/` workspace soul directory with skeleton files.
-fn soul_init(target: &std::path::Path) -> Result<()> {
+///
+/// `pub` so `b00t pr0ject init` (sub-project A) can compose it directly
+/// alongside `rep0 init` + provider selection rather than shelling back out
+/// to `b00t soul init` as a subprocess.
+pub fn soul_init(target: &std::path::Path) -> Result<()> {
     let soul_dir = target.join("._b00t_");
     std::fs::create_dir_all(&soul_dir).with_context(|| format!("create {}", soul_dir.display()))?;
 
@@ -1020,9 +1159,15 @@ async fn serve_soul_kv(host: &str, port: u16) -> Result<()> {
 
 // ── DataFramerr registry I/O ──────────────────────────────────────────────────
 
-/// Load the full TOML document from the active soul file.
-pub(crate) fn load_soul_doc() -> Result<toml::Table> {
-    let path = active_soul_path();
+/// Load the full TOML document from the active (legacy/default) soul file.
+pub fn load_soul_doc() -> Result<toml::Table> {
+    load_soul_doc_scoped(None)
+}
+
+/// #1102: scope-aware variant of `load_soul_doc`. `scope = None` is byte-for-
+/// byte identical to `load_soul_doc()` — the legacy/default shard.
+pub fn load_soul_doc_scoped(scope: Option<&SoulScope>) -> Result<toml::Table> {
+    let path = soul_path_for(scope);
     if !path.exists() {
         return Ok(toml::Table::new());
     }
@@ -1033,7 +1178,7 @@ pub(crate) fn load_soul_doc() -> Result<toml::Table> {
 }
 
 /// Extract [soul] → SoulDataFramerrRegistry from the doc.
-pub(crate) fn load_registry(doc: &toml::Table) -> Result<SoulDataFramerrRegistry> {
+pub fn load_registry(doc: &toml::Table) -> Result<SoulDataFramerrRegistry> {
     match doc.get("soul") {
         None => Ok(SoulDataFramerrRegistry::default()),
         Some(v) => {
@@ -1043,9 +1188,18 @@ pub(crate) fn load_registry(doc: &toml::Table) -> Result<SoulDataFramerrRegistry
     }
 }
 
-/// Serialize registry back into doc["soul"] and write the file.
-fn save_registry(mut doc: toml::Table, reg: &SoulDataFramerrRegistry) -> Result<()> {
-    let path = active_soul_path();
+/// Serialize registry back into doc["soul"] and write the legacy/default file.
+pub fn save_registry(doc: toml::Table, reg: &SoulDataFramerrRegistry) -> Result<()> {
+    save_registry_scoped(doc, reg, None)
+}
+
+/// #1102: scope-aware variant of `save_registry`.
+pub fn save_registry_scoped(
+    mut doc: toml::Table,
+    reg: &SoulDataFramerrRegistry,
+    scope: Option<&SoulScope>,
+) -> Result<()> {
+    let path = soul_path_for(scope);
     // Create parent dir if missing
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -1057,15 +1211,28 @@ fn save_registry(mut doc: toml::Table, reg: &SoulDataFramerrRegistry) -> Result<
         .with_context(|| format!("write {}", path.display()))
 }
 
-/// Read-modify-write helper.
-fn with_registry<F>(f: F) -> Result<()>
+/// Read-modify-write helper against the legacy/default shard.
+pub fn with_registry<F>(f: F) -> Result<()>
 where
     F: FnOnce(&mut SoulDataFramerrRegistry) -> Result<()>,
 {
-    let doc = load_soul_doc()?;
+    with_registry_scoped(None, f)
+}
+
+/// #1102: scope-aware variant of `with_registry`.
+pub fn with_registry_scoped<F>(scope: Option<&SoulScope>, f: F) -> Result<()>
+where
+    F: FnOnce(&mut SoulDataFramerrRegistry) -> Result<()>,
+{
+    let doc = load_soul_doc_scoped(scope)?;
     let mut reg = load_registry(&doc)?;
     f(&mut reg)?;
-    save_registry(doc, &reg)
+    save_registry_scoped(doc, &reg, scope)
+}
+
+/// Parse an optional `<kind>:<id>` scope flag value into a `SoulScope`.
+fn parse_scope(scope: &Option<String>) -> Result<Option<SoulScope>> {
+    scope.as_deref().map(SoulScope::parse_flag).transpose()
 }
 
 /// Parse "key=value" field args into a BTreeMap<String, SoulValue>.
@@ -1101,12 +1268,12 @@ fn agent_id() -> String {
 
 // ── table commands ────────────────────────────────────────────────────────────
 
-fn df_table_create(name: &str, columns: &[String]) -> Result<()> {
+fn df_table_create(name: &str, columns: &[String], scope: Option<SoulScope>) -> Result<()> {
     let cols: Vec<SoulColumn> = columns
         .iter()
         .map(|s| SoulColumn::parse(s))
         .collect::<Result<_>>()?;
-    with_registry(|reg| {
+    with_registry_scoped(scope.as_ref(), |reg| {
         if reg.tables.contains_key(name) {
             bail!("table '{name}' already exists; use frame-insert to add rows");
         }
@@ -1117,8 +1284,8 @@ fn df_table_create(name: &str, columns: &[String]) -> Result<()> {
     })
 }
 
-fn df_table_list() -> Result<()> {
-    let doc = load_soul_doc()?;
+fn df_table_list(scope: Option<SoulScope>) -> Result<()> {
+    let doc = load_soul_doc_scoped(scope.as_ref())?;
     let reg = load_registry(&doc)?;
     if reg.tables.is_empty() {
         println!("(no tables)");
@@ -1151,9 +1318,27 @@ fn df_table_show(name: &str) -> Result<()> {
     println!("table: {name}");
     println!("rows:  {}", df.rows.len());
     println!("columns:");
-    for c in &df.columns {
-        let nullable = if c.nullable { "?" } else { "" };
-        println!("  {}{}: {:?}", c.name, nullable, c.col_type);
+    if df.columns.is_empty() {
+        // #1273: Schemaless table — derive column set from row fields
+        let mut seen = std::collections::HashSet::new();
+        let mut derived: Vec<&str> = Vec::new();
+        for row in &df.rows {
+            for key in row.fields.keys() {
+                if seen.insert(key.as_str()) {
+                    derived.push(key.as_str());
+                }
+            }
+        }
+        if derived.is_empty() {
+            println!("  (schemaless, no rows yet)");
+        } else {
+            println!("  (schemaless — derived from rows: {})", derived.join(", "));
+        }
+    } else {
+        for c in &df.columns {
+            let nullable = if c.nullable { "?" } else { "" };
+            println!("  {}{}: {:?}", c.name, nullable, c.col_type);
+        }
     }
     let alarms: Vec<_> = reg.alarms.iter().filter(|a| a.table == name).collect();
     if !alarms.is_empty() {
@@ -1187,9 +1372,9 @@ fn df_table_drop(name: &str) -> Result<()> {
 
 // ── frame commands ────────────────────────────────────────────────────────────
 
-fn df_frame_insert(table: &str, fields: &[String]) -> Result<()> {
+fn df_frame_insert(table: &str, fields: &[String], scope: Option<SoulScope>) -> Result<()> {
     let field_map = parse_fields(fields)?;
-    with_registry(|reg| {
+    with_registry_scoped(scope.as_ref(), |reg| {
         let df = reg.tables.get_mut(table).ok_or_else(|| {
             anyhow::anyhow!("no table '{table}' — run: b00t soul table-create {table}")
         })?;
@@ -1199,8 +1384,8 @@ fn df_frame_insert(table: &str, fields: &[String]) -> Result<()> {
     })
 }
 
-fn df_frame_get(table: &str, id: u64) -> Result<()> {
-    let doc = load_soul_doc()?;
+fn df_frame_get(table: &str, id: u64, scope: Option<SoulScope>) -> Result<()> {
+    let doc = load_soul_doc_scoped(scope.as_ref())?;
     let reg = load_registry(&doc)?;
     let df = reg
         .tables
@@ -1220,8 +1405,8 @@ fn df_frame_get(table: &str, id: u64) -> Result<()> {
     Ok(())
 }
 
-fn df_frame_dump(table: &str, last: Option<usize>) -> Result<()> {
-    let doc = load_soul_doc()?;
+fn df_frame_dump(table: &str, last: Option<usize>, scope: Option<SoulScope>) -> Result<()> {
+    let doc = load_soul_doc_scoped(scope.as_ref())?;
     let reg = load_registry(&doc)?;
     let df = reg
         .tables
@@ -1235,8 +1420,22 @@ fn df_frame_dump(table: &str, last: Option<usize>) -> Result<()> {
         println!("(no rows in '{table}')");
         return Ok(());
     }
-    // collect all column keys in order
-    let cols: Vec<&str> = df.columns.iter().map(|c| c.name.as_str()).collect();
+    // collect all column keys — use declared schema, or derive from row fields
+    let cols: Vec<&str> = if df.columns.is_empty() {
+        // #1273: Schemaless table — derive column set from union of row field keys
+        let mut seen = std::collections::HashSet::new();
+        let mut derived = Vec::new();
+        for row in &rows {
+            for key in row.fields.keys() {
+                if seen.insert(key.as_str()) {
+                    derived.push(key.as_str());
+                }
+            }
+        }
+        derived
+    } else {
+        df.columns.iter().map(|c| c.name.as_str()).collect()
+    };
     print!("{:>4}  {:19}", "id", "created_at");
     for c in &cols {
         print!("  {:<16}", c);
@@ -1265,8 +1464,8 @@ fn df_frame_dump(table: &str, last: Option<usize>) -> Result<()> {
 
 // ── cursor commands ───────────────────────────────────────────────────────────
 
-fn df_cursor_create(name: &str, table: &str) -> Result<()> {
-    with_registry(|reg| {
+fn df_cursor_create(name: &str, table: &str, scope: Option<SoulScope>) -> Result<()> {
+    with_registry_scoped(scope.as_ref(), |reg| {
         if !reg.tables.contains_key(table) {
             bail!("no table '{table}'");
         }
@@ -1277,8 +1476,8 @@ fn df_cursor_create(name: &str, table: &str) -> Result<()> {
     })
 }
 
-fn df_cursor_next(name: &str) -> Result<()> {
-    let doc = load_soul_doc()?;
+fn df_cursor_next(name: &str, scope: Option<SoulScope>) -> Result<()> {
+    let doc = load_soul_doc_scoped(scope.as_ref())?;
     let mut reg = load_registry(&doc)?;
     let cursor = reg.cursors.get_mut(name).ok_or_else(|| {
         anyhow::anyhow!("no cursor '{name}' — run: b00t soul cursor-create {name} <table>")
@@ -1298,7 +1497,7 @@ fn df_cursor_next(name: &str) -> Result<()> {
             for (k, v) in &row.fields {
                 println!("  {} = {:?}", k, v);
             }
-            save_registry(doc, &reg)
+            save_registry_scoped(doc, &reg, scope.as_ref())
         }
         None => {
             println!("EOF: cursor '{name}' at end of '{table_name}'");
@@ -1307,8 +1506,8 @@ fn df_cursor_next(name: &str) -> Result<()> {
     }
 }
 
-fn df_cursor_reset(name: &str) -> Result<()> {
-    with_registry(|reg| {
+fn df_cursor_reset(name: &str, scope: Option<SoulScope>) -> Result<()> {
+    with_registry_scoped(scope.as_ref(), |reg| {
         let cursor = reg
             .cursors
             .get_mut(name)
@@ -1343,6 +1542,7 @@ fn df_alarm_set(
     condition: &str,
     aggregate: &str,
     emit: &str,
+    scope: Option<SoulScope>,
 ) -> Result<()> {
     let agg = match aggregate {
         "sum" => AlarmAggregate::Sum,
@@ -1351,7 +1551,7 @@ fn df_alarm_set(
         "per_frame" => AlarmAggregate::PerFrame,
         other => bail!("unknown aggregate '{other}'; valid: sum avg count per_frame"),
     };
-    with_registry(|reg| {
+    with_registry_scoped(scope.as_ref(), |reg| {
         reg.alarms.retain(|a| a.name != name);
         reg.alarms.push(SoulAlarm {
             name: name.to_string(),
@@ -1366,8 +1566,8 @@ fn df_alarm_set(
     })
 }
 
-fn df_alarm_check(table: &str) -> Result<()> {
-    let doc = load_soul_doc()?;
+fn df_alarm_check(table: &str, scope: Option<SoulScope>) -> Result<()> {
+    let doc = load_soul_doc_scoped(scope.as_ref())?;
     let reg = load_registry(&doc)?;
     let fired: Vec<_> = reg
         .alarms
@@ -1438,4 +1638,306 @@ fn df_token_decode(token: &str, context: &str) -> Result<()> {
     let plain = enc.decode(&id, context)?;
     println!("{}", plain);
     Ok(())
+}
+
+// ── #1102 shard management ──────────────────────────────────────────────────
+
+/// Enumerates on-disk shards under both the local-workspace and global
+/// `._b00t_/shards/<kind>/<id>/` roots (whichever exist), independent of
+/// today's local-vs-global "active" selection — this command is explicitly
+/// about seeing everything, not just what the current cwd would resolve to.
+fn shard_roots() -> Vec<std::path::PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(home) = dirs::home_dir() {
+        roots.push(home.join("._b00t_").join("shards"));
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        let local = cwd.join("._b00t_").join("shards");
+        if local.is_dir() {
+            roots.push(local);
+        }
+    }
+    roots
+}
+
+fn df_shard_list() -> Result<()> {
+    let mut found: Vec<SoulScope> = Vec::new();
+    for shards_root in shard_roots() {
+        if !shards_root.is_dir() {
+            continue;
+        }
+        let Ok(kind_entries) = std::fs::read_dir(&shards_root) else {
+            continue;
+        };
+        for kind_entry in kind_entries.flatten() {
+            let Some(kind) = kind_entry.file_name().to_str().and_then(ShardKind::parse) else {
+                continue;
+            };
+            let Ok(id_entries) = std::fs::read_dir(kind_entry.path()) else {
+                continue;
+            };
+            for id_entry in id_entries.flatten() {
+                if let Some(id) = id_entry.file_name().to_str() {
+                    let scope = SoulScope::new(kind, id);
+                    if !found.contains(&scope) {
+                        found.push(scope);
+                    }
+                }
+            }
+        }
+    }
+    if found.is_empty() {
+        println!("(no shards — all soul data lives in the legacy/default shard)");
+        return Ok(());
+    }
+    found.sort_by(|a, b| (a.kind.as_str(), &a.id).cmp(&(b.kind.as_str(), &b.id)));
+    for scope in &found {
+        println!("{scope}");
+    }
+    Ok(())
+}
+
+fn df_shard_export(scope: &SoulScope) -> Result<()> {
+    let doc = load_soul_doc_scoped(Some(scope))?;
+    println!("{}", toml::to_string_pretty(&doc)?);
+    Ok(())
+}
+
+fn df_shard_delete(scope: &SoulScope) -> Result<()> {
+    let path = soul_path_for(Some(scope));
+    if !path.exists() {
+        println!("shard '{scope}' has no on-disk data — nothing to delete");
+        return Ok(());
+    }
+    let shard_dir = path.parent().ok_or_else(|| {
+        anyhow::anyhow!("shard path '{}' has no parent directory", path.display())
+    })?;
+    std::fs::remove_dir_all(shard_dir)
+        .with_context(|| format!("delete shard directory {}", shard_dir.display()))?;
+    println!("shard '{scope}' deleted ({})", shard_dir.display());
+    Ok(())
+}
+
+#[cfg(test)]
+mod shard_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    // #1102 shard resolution prefers a LOCAL `._b00t_/` (cwd-based) over the
+    // global (HOME-based) root, and falls back to the latter only when cwd
+    // has no `._b00t_/`. Isolating via `std::env::set_current_dir` would
+    // collide with several OTHER, pre-existing test modules in this same
+    // binary that independently mutate cwd with only a module-local mutex
+    // each (see e.g. main.rs's `datum_dir_resolution_tests`, commands::init,
+    // commands::skill — none coordinate with each other, since cwd is
+    // process-global across the whole `cargo test` binary). Isolating via
+    // HOME instead has a much smaller collision surface (only one other
+    // module, b00t-cli's own top-level `tests::TempHome`, touches HOME), so
+    // that's what these tests do, matching that existing precedent.
+    static HOME_LOCK: Mutex<()> = Mutex::new(());
+
+    struct TempHome {
+        _guard: std::sync::MutexGuard<'static, ()>,
+        old_home: Option<String>,
+        _temp_dir: tempfile::TempDir,
+    }
+
+    impl TempHome {
+        fn new() -> Self {
+            let guard = HOME_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let old_home = std::env::var("HOME").ok();
+            let temp_dir = tempfile::tempdir().unwrap();
+            // SAFETY: guarded by HOME_LOCK above.
+            unsafe {
+                std::env::set_var("HOME", temp_dir.path());
+            }
+            Self {
+                _guard: guard,
+                old_home,
+                _temp_dir: temp_dir,
+            }
+        }
+    }
+
+    impl Drop for TempHome {
+        fn drop(&mut self) {
+            // SAFETY: guarded by HOME_LOCK, held until this guard drops.
+            unsafe {
+                match &self.old_home {
+                    Some(h) => std::env::set_var("HOME", h),
+                    None => std::env::remove_var("HOME"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn scoped_write_is_isolated_from_legacy_and_other_shards() {
+        let _home = TempHome::new();
+        let agent_foo = SoulScope::new(ShardKind::Agent, "foo");
+        let agent_bar = SoulScope::new(ShardKind::Agent, "bar");
+
+        df_table_create("t", &["x:int".to_string()], Some(agent_foo.clone())).unwrap();
+        df_frame_insert("t", &["x=1".to_string()], Some(agent_foo.clone())).unwrap();
+
+        // Same table name in a sibling shard must not see foo's row.
+        let bar_doc = load_soul_doc_scoped(Some(&agent_bar)).unwrap();
+        let bar_reg = load_registry(&bar_doc).unwrap();
+        assert!(!bar_reg.tables.contains_key("t"));
+
+        // Legacy/default shard must not see it either.
+        let legacy_doc = load_soul_doc_scoped(None).unwrap();
+        let legacy_reg = load_registry(&legacy_doc).unwrap();
+        assert!(!legacy_reg.tables.contains_key("t"));
+
+        // The actual shard sees exactly one row.
+        let foo_doc = load_soul_doc_scoped(Some(&agent_foo)).unwrap();
+        let foo_reg = load_registry(&foo_doc).unwrap();
+        assert_eq!(foo_reg.tables.get("t").unwrap().rows.len(), 1);
+    }
+
+    #[test]
+    fn shard_list_export_delete_round_trip() {
+        let _home = TempHome::new();
+        let scope = SoulScope::new(ShardKind::Tool, "grok");
+        df_table_create("lessons", &["note:text".to_string()], Some(scope.clone())).unwrap();
+
+        df_shard_list().unwrap(); // smoke test: must not error with data present
+
+        let path = soul_path_for(Some(&scope));
+        assert!(path.exists());
+
+        df_shard_delete(&scope).unwrap();
+        assert!(!path.exists());
+
+        // Deleting again is a no-op, not an error.
+        df_shard_delete(&scope).unwrap();
+    }
+
+    /// End-to-end regression test for the reported `soul table-create` /
+    /// `soul frame-insert` bug (surfaced via the b00t-mcp `soul_table_create`
+    /// tool creating zero-column tables): a table created with a
+    /// multi-column spec must register EVERY declared column (not zero), and
+    /// rows inserted afterwards must persist and round-trip EVERY inserted
+    /// field (not just the auto `id`/`created_at`). Exercises the exact
+    /// command-handler functions the CLI dispatches to (`df_table_create`,
+    /// `df_frame_insert`) with the same table/column/field shapes from the
+    /// original bug report, going through real TOML save+reload — not just
+    /// the lower-level `SoulDataFramerr` struct (which already had its own
+    /// unit tests and was never the bug).
+    #[test]
+    fn table_create_with_columns_then_frame_insert_roundtrips_all_fields() {
+        let _home = TempHome::new();
+        let scope = SoulScope::new(ShardKind::Agent, "provider-rank-repro");
+
+        let column_specs = [
+            "task:text",
+            "provider:text",
+            "model:text",
+            "rank:int?",
+            "status:text",
+            "evidence:text",
+            "recorded_at:timestamp",
+        ];
+        df_table_create(
+            "provider_task_rank",
+            &column_specs
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>(),
+            Some(scope.clone()),
+        )
+        .unwrap();
+
+        // Bug 1: table-create must register ALL declared columns, not zero.
+        let doc = load_soul_doc_scoped(Some(&scope)).unwrap();
+        let reg = load_registry(&doc).unwrap();
+        let table = reg.tables.get("provider_task_rank").unwrap();
+        assert_eq!(
+            table.columns.len(),
+            column_specs.len(),
+            "all declared columns must be registered — got: {:?}",
+            table.columns
+        );
+        let names: Vec<&str> = table.columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "task",
+                "provider",
+                "model",
+                "rank",
+                "status",
+                "evidence",
+                "recorded_at"
+            ]
+        );
+
+        // Insert 5 rows, mirroring the original bug report's repro shape.
+        for i in 0..5 {
+            let model = if i % 2 == 0 {
+                "apac.amazon.nova-pro-v1:0"
+            } else {
+                "apac.amazon.nova-lite-v1:0"
+            };
+            df_frame_insert(
+                "provider_task_rank",
+                &[
+                    "task=rust_codegen".to_string(),
+                    "provider=bedrock".to_string(),
+                    format!("model={model}"),
+                    "rank=0".to_string(),
+                    "status=flopped".to_string(),
+                    format!("evidence=run-{i}"),
+                    "recorded_at=2026-09-05T12:46:00Z".to_string(),
+                ],
+                Some(scope.clone()),
+            )
+            .unwrap();
+        }
+
+        // Bug 2: every inserted field must persist and round-trip — not just
+        // id/created_at. This is downstream of bug 1: frame-dump renders
+        // columns from `df.columns`, so it only ever showed anything once
+        // that list stopped being empty.
+        let doc = load_soul_doc_scoped(Some(&scope)).unwrap();
+        let reg = load_registry(&doc).unwrap();
+        let table = reg.tables.get("provider_task_rank").unwrap();
+        assert_eq!(table.rows.len(), 5);
+        assert_eq!(table.columns.len(), column_specs.len());
+
+        let row = &table.rows[0];
+        assert_eq!(row.id, 1);
+        assert_eq!(
+            row.fields.get("task"),
+            Some(&SoulValue::Text("rust_codegen".into()))
+        );
+        assert_eq!(
+            row.fields.get("provider"),
+            Some(&SoulValue::Text("bedrock".into()))
+        );
+        assert_eq!(
+            row.fields.get("model"),
+            Some(&SoulValue::Text("apac.amazon.nova-pro-v1:0".into()))
+        );
+        assert_eq!(row.fields.get("rank"), Some(&SoulValue::Int(0)));
+        assert_eq!(
+            row.fields.get("status"),
+            Some(&SoulValue::Text("flopped".into()))
+        );
+        assert_eq!(
+            row.fields.get("evidence"),
+            Some(&SoulValue::Text("run-0".into()))
+        );
+        assert_eq!(
+            row.fields.get("recorded_at"),
+            Some(&SoulValue::Text("2026-09-05T12:46:00Z".into()))
+        );
+
+        // frame-get iterates row.fields directly, so it must also see them.
+        let last_row = df_frame_get("provider_task_rank", 5, Some(scope.clone()));
+        assert!(last_row.is_ok());
+    }
 }

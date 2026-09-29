@@ -51,6 +51,12 @@ pub mod gate_result;
 pub mod grok;
 pub mod interaction;
 pub mod irontology_bridge;
+#[cfg(feature = "store-oxigraph")]
+pub mod graph_load;
+#[cfg(feature = "store-oxigraph")]
+pub mod graph_shapes;
+#[cfg(feature = "store-oxigraph")]
+pub mod graph_kerml;
 pub mod knowledge;
 pub mod kv_store;
 pub mod learn;
@@ -59,6 +65,9 @@ pub mod lfmf_telemetry;
 pub mod lsp_proxy;
 pub mod man_page;
 pub mod mcp_proxy;
+pub mod remote_mcp_proxy;
+pub mod mcp_placement;
+pub mod mcp_placement_aca;
 pub mod mcp_registry;
 pub mod ooda;
 pub mod pipeline_nodes;
@@ -69,7 +78,9 @@ pub mod redis;
 pub mod reviewer;
 pub mod rhai_engine;
 pub mod runtime_env;
+pub mod satisfies;
 pub mod secret_validation;
+pub mod reviewer_gate;
 pub mod sm0l_dispatch;
 pub mod state_introspection;
 pub mod sudo_operator;
@@ -121,6 +132,9 @@ pub use kv_store::{KvBackend, KvConfig, KvStore, ZellijKvEntry};
 pub use lfmf::{Lesson, LfmfConfig, LfmfSystem};
 pub use man_page::{ManPage, ManSection};
 pub use mcp_proxy::{GenericMcpProxy, McpToolDefinition, McpToolRequest, McpToolResponse};
+pub use remote_mcp_proxy::{RemoteMcpProxy, RemoteRoute};
+pub use mcp_placement::{Endpoint, LaunchSpec, McpPlacement, PlacementStatus, PodmanPlacement};
+pub use mcp_placement_aca::AcaPlacement;
 pub use mcp_registry::{
     McpRegistry, McpServerConfig, McpServerRegistration, create_registration_from_datum,
 };

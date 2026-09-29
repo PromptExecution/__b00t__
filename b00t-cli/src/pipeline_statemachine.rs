@@ -41,9 +41,11 @@
 //!               (StageFailed) ──────────────────────────────┘
 //! ```
 
+use crate::pipeline_transitions::{TransitionRecord, TransitionSink};
 use crate::pipeline_types::{PipelineDag, PipelineError};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 // ── GH #743: Pipeline state machine ──
 
@@ -90,6 +92,150 @@ pub enum PipelineEvent {
     Retry(u32),
 }
 
+/// Bridges `PipelineState`/`PipelineEvent` to `b00t_c0re_lib`'s shared,
+/// standards-based statechart representation (W3C SCXML via the `scxml`
+/// crate — see `elasticdotventures/_b00t_#1177` P5b/P6), alongside the
+/// existing Mermaid/S5 renderers any `StateMachineIntrospection`
+/// implementor gets for free. This never replaces `StateMachine::transition`/
+/// `can_transition`'s real enforcement logic above — it's a static
+/// description of the state graph's shape, not a re-derivation of it.
+///
+/// Written by hand rather than via `impl_state_machine_introspection!`:
+/// `Running`'s real target on `StageComplete` depends on data
+/// (`self.dag`'s stage count, not just the enum discriminant), which the
+/// macro's `can_transition(source, target) -> bool` shape can't express.
+/// Both possible outcomes are represented as separate transitions,
+/// disambiguated by a named guard (the SCXML idiom for exactly this: a
+/// condition the host evaluates, not Rust code baked into the model).
+#[cfg(feature = "statechart")]
+impl b00t_c0re_lib::state_introspection::StateMachineIntrospection for PipelineState {
+    fn machine_id() -> &'static str {
+        "PipelineState"
+    }
+
+    fn initial_state() -> &'static str {
+        "Idle"
+    }
+
+    fn final_states() -> &'static [&'static str] {
+        // Soft, diagram-level "ending states" — both still accept a
+        // `Validate` restart transition back to `Idle` (see the table
+        // below), so neither exports as a real SCXML `Final` state.
+        &["Completed", "Failed"]
+    }
+
+    fn state_type_descriptors() -> Vec<b00t_c0re_lib::state_introspection::StateTypeDescriptor> {
+        [
+            "Idle",
+            "Validating",
+            "Scheduling",
+            "Running",
+            "Paused",
+            "Failed",
+            "Completed",
+        ]
+        .iter()
+        .map(
+            |&id| b00t_c0re_lib::state_introspection::StateTypeDescriptor {
+                id,
+                rust_type: std::any::type_name::<PipelineState>(),
+                classifier: "enum_variant",
+            },
+        )
+        .collect()
+    }
+
+    fn transition_descriptors()
+    -> Vec<b00t_c0re_lib::state_introspection::StateTransitionDescriptor> {
+        use b00t_c0re_lib::state_introspection::StateTransitionDescriptor;
+        vec![
+            StateTransitionDescriptor {
+                source: "Idle",
+                event: "Validate",
+                target: "Validating",
+                guard: None,
+            },
+            StateTransitionDescriptor {
+                source: "Validating",
+                event: "Schedule",
+                target: "Scheduling",
+                guard: None,
+            },
+            StateTransitionDescriptor {
+                source: "Validating",
+                event: "StageFailed",
+                target: "Failed",
+                guard: None,
+            },
+            StateTransitionDescriptor {
+                source: "Scheduling",
+                event: "Execute",
+                target: "Running",
+                guard: None,
+            },
+            StateTransitionDescriptor {
+                source: "Scheduling",
+                event: "StageFailed",
+                target: "Failed",
+                guard: None,
+            },
+            StateTransitionDescriptor {
+                source: "Running",
+                event: "StageComplete",
+                target: "Running",
+                guard: Some("stage_index < last_stage"),
+            },
+            StateTransitionDescriptor {
+                source: "Running",
+                event: "StageComplete",
+                target: "Completed",
+                guard: Some("stage_index == last_stage"),
+            },
+            StateTransitionDescriptor {
+                source: "Running",
+                event: "StageFailed",
+                target: "Failed",
+                guard: None,
+            },
+            StateTransitionDescriptor {
+                source: "Running",
+                event: "Pause",
+                target: "Paused",
+                guard: None,
+            },
+            StateTransitionDescriptor {
+                source: "Paused",
+                event: "Resume",
+                target: "Running",
+                guard: None,
+            },
+            StateTransitionDescriptor {
+                source: "Paused",
+                event: "Cancel",
+                target: "Failed",
+                guard: None,
+            },
+            StateTransitionDescriptor {
+                source: "Failed",
+                event: "Validate",
+                target: "Idle",
+                guard: None,
+            },
+            StateTransitionDescriptor {
+                source: "Completed",
+                event: "Validate",
+                target: "Idle",
+                guard: None,
+            },
+        ]
+    }
+}
+
+#[cfg(feature = "statechart")]
+pub fn pipeline_state_scxml() -> String {
+    <PipelineState as b00t_c0re_lib::state_introspection::StateMachineIntrospection>::render_scxml()
+}
+
 /// A finite state machine for pipeline lifecycle management.
 ///
 /// Wraps the current state, an append-only transition history (every
@@ -113,7 +259,7 @@ pub enum PipelineEvent {
 /// | `Paused(n)` | `Cancel` | `Failed` |
 /// | `Failed` | `Validate` | `Idle` |
 /// | `Completed` | `Validate` | `Idle` |
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct StateMachine {
     /// Current pipeline state.
     current: PipelineState,
@@ -123,6 +269,26 @@ pub struct StateMachine {
     dag: PipelineDag,
     /// Optional external run identifier for traceability.
     run_id: Option<String>,
+    /// Optional sink every transition is durably/live recorded to, in
+    /// addition to `history`. A trait object, so it can't be
+    /// serialized/deserialized — skipped on both; deserialized machines
+    /// start with no sink attached (attach one explicitly via
+    /// `with_transition_sink` after deserializing, if needed).
+    #[serde(skip)]
+    sink: Option<Arc<dyn TransitionSink>>,
+}
+
+/// Hand-written since `sink`'s trait object isn't `Debug` — everything else
+/// is delegated to the derived-equivalent fields, plus a `has_sink` flag.
+impl std::fmt::Debug for StateMachine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StateMachine")
+            .field("current", &self.current)
+            .field("history_len", &self.history.len())
+            .field("run_id", &self.run_id)
+            .field("has_sink", &self.sink.is_some())
+            .finish()
+    }
 }
 
 impl StateMachine {
@@ -134,7 +300,22 @@ impl StateMachine {
             history: Vec::new(),
             dag,
             run_id: None,
+            sink: None,
         }
+    }
+
+    /// Attach an external run identifier for traceability. Also included in
+    /// every [`TransitionRecord`] sent to an attached sink.
+    pub fn with_run_id(mut self, run_id: impl Into<String>) -> Self {
+        self.run_id = Some(run_id.into());
+        self
+    }
+
+    /// Attach a sink that every future `transition()` call durably/live
+    /// records to, in addition to updating the in-memory `history`.
+    pub fn with_transition_sink(mut self, sink: Arc<dyn TransitionSink>) -> Self {
+        self.sink = Some(sink);
+        self
     }
 
     /// Attempt a state transition driven by `event`.
@@ -197,6 +378,24 @@ impl StateMachine {
         let timestamp = Utc::now();
         self.history.push((self.current.clone(), event, timestamp));
         self.current = next_state.clone();
+
+        if let Some(sink) = &self.sink {
+            // Read back the entry just pushed rather than re-deriving it —
+            // `event` was moved into `history` above.
+            let (from_state, recorded_event, _) = self.history.last().expect("just pushed");
+            let rec = TransitionRecord {
+                run_id: self.run_id.clone().unwrap_or_default(),
+                seq: self.history.len() as u64,
+                from_state: from_state.clone(),
+                event: recorded_event.clone(),
+                to_state: next_state.clone(),
+                timestamp,
+            };
+            if let Err(e) = sink.record(&rec) {
+                eprintln!("[pipeline_statemachine] failed to persist transition: {e}");
+            }
+        }
+
         Ok(next_state)
     }
 
@@ -515,6 +714,50 @@ mod tests {
 
         sm.transition(PipelineEvent::Validate).unwrap();
         assert_eq!(*sm.state(), PipelineState::Validating);
+    }
+
+    // ── Statechart export (elasticdotventures/_b00t_#1177 P6) ───────────
+
+    #[test]
+    #[cfg(feature = "statechart")]
+    fn pipeline_state_scxml_round_trips_and_covers_every_real_transition() {
+        use b00t_c0re_lib::state_introspection::StateMachineIntrospection;
+
+        let chart = <PipelineState as StateMachineIntrospection>::render_scxml_statechart();
+        scxml::validate(&chart)
+            .expect("PipelineState's exported statechart should be structurally valid SCXML");
+
+        let xml = pipeline_state_scxml();
+        let parsed = scxml::parse_xml(&xml).expect("exported XML must parse back as valid SCXML");
+        assert_eq!(parsed, chart);
+
+        // Every descriptor must actually round-trip, including both
+        // guard-disambiguated Running -> {Running, Completed} branches.
+        let transitions =
+            <PipelineState as StateMachineIntrospection>::transition_descriptors();
+        assert_eq!(transitions.len(), 13);
+        for transition in &transitions {
+            let source = parsed
+                .find_state(transition.source)
+                .unwrap_or_else(|| panic!("missing state {} in exported SCXML", transition.source));
+            let found = source.transitions.iter().any(|t| {
+                t.event.as_ref().map(|e| e.as_str()) == Some(transition.event)
+                    && t.targets == vec![transition.target]
+                    && t.guard.as_ref().map(|g| g.as_str()) == transition.guard
+            });
+            assert!(found, "missing SCXML transition: {transition:?}");
+        }
+
+        // Neither `Completed` nor `Failed` is a real SCXML Final state —
+        // both still accept a `Validate` restart transition to `Idle`.
+        assert_eq!(
+            parsed.find_state("Completed").unwrap().kind,
+            scxml::model::StateKind::Atomic
+        );
+        assert_eq!(
+            parsed.find_state("Failed").unwrap().kind,
+            scxml::model::StateKind::Atomic
+        );
     }
 
     // ── Validate from Failed goes to Idle first ─────────────────────────

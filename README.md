@@ -22,14 +22,97 @@ about it.
 curl -fsSL https://raw.githubusercontent.com/elasticdotventures/_b00t_/main/install.sh | bash
 ```
 
-Downloads the binary from GitHub Releases and verifies its SHA256 checksum. Linux
-x86_64/aarch64/armv7, macOS Intel/Apple Silicon.
+This is the **canonical, zero-to-hero installer** — it's the only supported path and the
+one to link people to. It downloads the release binary for your platform (Linux
+x86_64/aarch64/armv7, macOS Intel/Apple Silicon) and verifies its SHA256 checksum; if no
+matching release asset exists (unsupported platform, GitHub unreachable), it falls back to
+installing `rustup` and building from source automatically — no manual intervention either
+way. It also lays out `~/.b00t/_b00t_` (the datum compendium) and exports `_B00T_Path` in
+your shell rc — **this step is not optional**, `b00t` is non-functional without it (see
+Troubleshooting below).
+
+After it finishes, `source ~/.bashrc` (or open a new terminal) — `curl | sh` runs in a
+subshell, so the current one doesn't have the updated `PATH`/`_B00T_Path` yet.
+
+**Developer / full-hive install** (clone the repo, get the capability-aware installer that
+also wires up a systemd/quadlet/launchd/k8s service depending on what your machine has):
 
 ```bash
-cargo install b00t-cli          # from crates.io
-# or from source:
-git clone https://github.com/elasticdotventures/_b00t_.git && cd _b00t_ && cargo install --path b00t-cli
+git clone https://github.com/elasticdotventures/_b00t_.git && cd _b00t_
+./scripts/install-b00t.sh              # auto-detects best service mode, prompts if ambiguous
+./scripts/install-b00t.sh --mode k8s   # or force one: k8s | quadlet | systemd-user | systemd-sys | launchd | binaries
 ```
+
+⚠️ **Don't `cargo install b00t-cli` on its own.** It builds the binary but ships none of the
+`_b00t_` datums the binary needs to do anything (`b00t whoami`, `b00t learn`, etc. will fail)
+— use one of the two installers above, which always pair the binary with its datums.
+
+### 🔄 Update
+
+```bash
+b00t version check          # compare installed vs. latest release
+b00t version upgrade -y     # re-runs the installer above (release binary, or source-build fallback)
+```
+
+`b00t version upgrade` shells out to the same `install.sh` — one script, one code path, for
+both first install and every upgrade after it. Inside a repo checkout it also offers
+`--strategy=workspace-build` (plain `cargo install --path` from your local tree) or
+`--strategy=workspace-sync` for iterating on b00t itself.
+
+### 🩺 Troubleshooting
+
+**`b00t whoami` / `b00t learn` fail or come back empty** — `_B00T_Path` isn't set, or points
+somewhere with no datums. Check `echo $_B00T_Path` (should be `~/.b00t/_b00t_` after the
+installer); if empty, `source ~/.bashrc` or re-run the installer. This is the single most
+common way to end up with a b00t binary that looks installed but does nothing.
+
+---
+
+## 🪟 Windows desktop and browser extension
+
+**`ledgrrr` desktop (Windows x64)** — MSI and NSIS installers are published on
+[GitHub Releases](https://github.com/elasticdotventures/_b00t_/releases/tag/ledgrrr-desktop-v1.9.0):
+
+```powershell
+# MSI
+curl -LO https://github.com/elasticdotventures/_b00t_/releases/download/ledgrrr-desktop-v1.9.0/ledgrrr_1.9.0_x64_en-US.msi
+curl -LO https://github.com/elasticdotventures/_b00t_/releases/download/ledgrrr-desktop-v1.9.0/ledgrrr_1.9.0_x64_en-US.msi.sha256
+certutil -hashfile ledgrrr_1.9.0_x64_en-US.msi SHA256   # compare against the .sha256 file
+
+# or NSIS
+curl -LO https://github.com/elasticdotventures/_b00t_/releases/download/ledgrrr-desktop-v1.9.0/ledgrrr_1.9.0_x64-setup.exe
+curl -LO https://github.com/elasticdotventures/_b00t_/releases/download/ledgrrr-desktop-v1.9.0/ledgrrr_1.9.0_x64-setup.exe.sha256
+certutil -hashfile ledgrrr_1.9.0_x64-setup.exe SHA256   # compare against the .sha256 file
+```
+
+These are unsigned installer builds — verify the SHA256 before running. A Winget
+package (`PromptExecution.ledgrrr`) has been prepared and is pending submission; there is
+still no published Microsoft Edge Add-ons listing for `b00t-browser-ext`. Do not use a
+guessed Winget package identifier or install an extension from an untrusted ZIP.
+
+To build the desktop installer from source instead (e.g. other architectures):
+
+```powershell
+git clone --recurse-submodules https://github.com/elasticdotventures/_b00t_.git
+cd _b00t_/vendor/ledgrrr/crates/ledgerr-tauri
+cargo install tauri-cli --version "^2" --locked
+cargo tauri build --bundles msi,nsis
+# Run the MSI in target/release/bundle/msi/ or the NSIS EXE in target/release/bundle/nsis/
+```
+
+To build the b00t browser extension for local Microsoft Edge testing:
+
+```powershell
+cd _b00t_/b00t-browser-ext
+npm ci
+npm run package
+Expand-Archive build/chrome-mv3-prod.zip build/edge-unpacked
+# In Edge: edge://extensions → enable Developer mode → Load unpacked → build/edge-unpacked
+```
+
+The desktop installer is submitted to Winget separately from the browser extension, which
+is submitted to Microsoft Edge Add-ons — these are separate channels: Winget does not
+install browser extensions.
 
 ---
 
