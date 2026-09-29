@@ -1093,6 +1093,44 @@ pub fn mcp_output(path: &str, use_mcp_servers_wrapper: bool, servers: &str) -> R
 }
 
 /// Extract command and args from MCP datum, handling both new multi-method and legacy formats
+/// Substitute `{{env.VAR}}` placeholders in stdio args with the current
+/// process environment (#61: "Datum supports templating" /
+/// "Environment variable substitution in datum args"). A placeholder whose
+/// var is unset is left literal and warned about once, rather than silently
+/// resolving to an empty string -- an install that goes on to spawn a
+/// literal `{{env.BROWSER_URL}}` on the command line is at least
+/// diagnosable, whereas an empty string looks like a valid (wrong) value.
+fn substitute_env_templates(args: &[String]) -> Vec<String> {
+    args.iter()
+        .map(|arg| {
+            let mut out = arg.clone();
+            let mut start = 0;
+            while let Some(rel) = out[start..].find("{{env.") {
+                let open = start + rel;
+                let Some(rel_close) = out[open..].find("}}") else {
+                    break;
+                };
+                let close = open + rel_close + 2;
+                let var_name = out[open + 6..close - 2].to_string();
+                match std::env::var(&var_name) {
+                    Ok(val) => {
+                        let val_len = val.len();
+                        out.replace_range(open..close, &val);
+                        start = open + val_len;
+                    }
+                    Err(_) => {
+                        eprintln!(
+                            "\u{26a0}\u{fe0f}  {{{{env.{var_name}}}}} is unset -- leaving it literal in the installed args. Export {var_name} before installing to fill it in."
+                        );
+                        start = close;
+                    }
+                }
+            }
+            out
+        })
+        .collect()
+}
+
 fn extract_mcp_command_args(datum: &BootDatum) -> (String, Vec<String>) {
     if let Some(mcp) = &datum.mcp {
         if let Some(stdio_methods) = &mcp.stdio {
@@ -1248,6 +1286,7 @@ fn resolve_provisioned_command_args_env(
     datum: &BootDatum,
 ) -> Result<(String, Vec<String>, Option<std::collections::HashMap<String, String>>)> {
     let (command, args, static_env, _transport) = select_mcp_method(datum, None, false)?;
+    let args = substitute_env_templates(&args);
 
     let mut env = static_env.unwrap_or_default();
     if let Some(provision) = &datum.ai_provision {
@@ -1439,6 +1478,7 @@ pub fn codex_install_mcp(
     let datum = crate::get_mcp_config(name, path)?;
     let (command, args, env, method_type) =
         select_mcp_method(&datum, stdio_command, use_httpstream)?;
+    let args = substitute_env_templates(&args);
 
     let mut codex_args = vec!["mcp".to_string(), "add".to_string()];
 
@@ -1571,6 +1611,7 @@ pub fn dotmcpjson_install_mcp(
 
     let (command, args, env, method_type) =
         select_mcp_method(&datum, stdio_command, use_httpstream)?;
+    let args = substitute_env_templates(&args);
 
     let server_config = if method_type == "httpstream" {
         // #1344: emit type/headers from bearer_token_env_var, http_headers, env_http_headers
@@ -1642,6 +1683,7 @@ pub fn opencode_install_mcp(
     let datum = crate::get_mcp_config(name, path)?;
     let (command, args, env, method_type) =
         select_mcp_method(&datum, stdio_command, use_httpstream)?;
+    let args = substitute_env_templates(&args);
 
     let mut command_arr = vec![command.clone()];
     command_arr.extend(args.clone());
